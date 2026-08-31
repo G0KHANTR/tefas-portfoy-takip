@@ -3,9 +3,9 @@ from flask_sqlalchemy import SQLAlchemy
 from flask_login import LoginManager, UserMixin, login_user, login_required, logout_user, current_user
 from werkzeug.security import generate_password_hash, check_password_hash
 from flask_cors import CORS
-import tefas
 from datetime import datetime, timedelta
 import calendar
+import requests
 import os
 
 app = Flask(__name__)
@@ -17,8 +17,6 @@ db = SQLAlchemy(app)
 login_manager = LoginManager(app)
 login_manager.login_view = 'login'
 CORS(app)
-
-tefas_client = tefas.Crawler()
 
 # ==================== VERİTABANI MODELLERİ ====================
 
@@ -41,7 +39,7 @@ class Transaction(db.Model):
     user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
     tarih = db.Column(db.String(10), nullable=False)
     kod = db.Column(db.String(10), nullable=False)
-    tip = db.Column(db.String(5), nullable=False) # AL / SAT
+    tip = db.Column(db.String(5), nullable=False)
     adet = db.Column(db.Float, nullable=False)
     fiyat = db.Column(db.Float, nullable=False)
 
@@ -49,7 +47,6 @@ class Transaction(db.Model):
 def load_user(user_id):
     return User.query.get(int(user_id))
 
-# Veritabanını oluştur ve Varsayılan Admin Hesabı Ekle
 with app.app_context():
     db.create_all()
     if not User.query.filter_by(username='admin').first():
@@ -58,73 +55,58 @@ with app.app_context():
         db.session.add(admin)
         db.session.commit()
 
-# ==================== TEFAS YARDIMCI FONKSİYONLARI ====================
+# ==================== TEFAS YARDIMCI FONKSİYONLARI (API DIRECT) ====================
+
+def fetch_tefas_raw(fon_kodu, start_date, end_date):
+    url = "https://www.tefas.gov.tr/api/DB/BindHistoryInfo"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "X-Requested-With": "XMLHttpRequest"
+    }
+    # TEFAS API formatı: MM/DD/YYYY
+    start_dt = datetime.strptime(start_date, "%Y-%m-%d").strftime("%m/%d/%Y")
+    end_dt = datetime.strptime(end_date, "%Y-%m-%d").strftime("%m/%d/%Y")
+    
+    payload = {
+        "fontType": "YAT",
+        "startDate": start_dt,
+        "endDate": end_dt,
+        "fontKod": fon_kodu.upper()
+    }
+    try:
+        r = requests.post(url, headers=headers, data=payload, timeout=10)
+        if r.status_code == 200:
+            return r.json().get('data', [])
+    except Exception as e:
+        print(f"API Hata: {e}")
+    return []
 
 def get_tefas_price_on_date(fon_kodu, hedef_tarih_str):
-    try:
-        hedef_tarih = datetime.strptime(hedef_tarih_str, "%Y-%m-%d")
-        baslangic = hedef_tarih - timedelta(days=10)
-        df = tefas_client.fetch(start=baslangic.strftime("%Y-%m-%d"), end=hedef_tarih_str, name=fon_kodu.upper())
-        if df is not None and not df.empty:
-            df['date'] = df['date'].astype(str)
-            df = df.sort_values(by='date', ascending=False)
-            gecmis_df = df[df['date'] <= hedef_tarih_str]
-            if not gecmis_df.empty:
-                return {"price": round(float(gecmis_df.iloc[0]['price']), 6), "date": gecmis_df.iloc[0]['date']}
-    except Exception as e:
-        print(f"Hata: {e}")
+    hedef_tarih = datetime.strptime(hedef_tarih_str, "%Y-%m-%d")
+    baslangic = (hedef_tarih - timedelta(days=10)).strftime("%Y-%m-%d")
+    data = fetch_tefas_raw(fon_kodu, baslangic, hedef_tarih_str)
+    if data:
+        # En güncel tarihi al
+        last_item = data[-1]
+        raw_date = datetime.fromtimestamp(int(last_item['TARIH']) / 1000).strftime("%Y-%m-%d")
+        return {"price": float(last_item['FIYAT']), "date": raw_date}
     return None
 
 def get_tefas_data_crawler(fon_kodu):
-    try:
-        bugun = datetime.now()
-        baslangic = bugun - timedelta(days=1850)
-        df = tefas_client.fetch(start=baslangic.strftime("%Y-%m-%d"), end=bugun.strftime("%Y-%m-%d"), name=fon_kodu.upper())
-        if df is not None and not df.empty:
-            df['date'] = df['date'].astype(str)
-            df = df.sort_values(by='date', ascending=False)
-            guncel_fiyat = float(df.iloc[0]['price'])
-            guncel_tarih_str = df.iloc[0]['date']
-            guncel_tarih = datetime.strptime(guncel_tarih_str, "%Y-%m-%d")
-
-            def get_price_for_target(year, month, day):
-                max_days = calendar.monthrange(year, month)[1]
-                tarih_str = f"{year:04d}-{month:02d}-{min(day, max_days):02d}"
-                gecmis_df = df[df['date'] <= tarih_str]
-                return float(gecmis_df.iloc[0]['price']) if not gecmis_df.empty else None
-
-            def calc_return_by_months(m):
-                year, month = guncel_tarih.year, guncel_tarih.month - m
-                while month <= 0: month += 12; year -= 1
-                old_p = get_price_for_target(year, month, guncel_tarih.day)
-                return round(((guncel_fiyat - old_p) / old_p) * 100, 2) if old_p else None
-
-            def calc_return_by_days(d):
-                tarih_str = (guncel_tarih - timedelta(days=d)).strftime("%Y-%m-%d")
-                gecmis_df = df[df['date'] <= tarih_str]
-                if not gecmis_df.empty:
-                    old_p = float(gecmis_df.iloc[0]['price'])
-                    return round(((guncel_fiyat - old_p) / old_p) * 100, 2) if old_p > 0 else None
-                return None
-
-            return {
-                "code": fon_kodu.upper(),
-                "title": df.iloc[0].get('title', fon_kodu.upper()),
-                "price": round(guncel_fiyat, 6),
-                "date": guncel_tarih_str,
-                "market_cap": df.iloc[0].get('market_cap', 0),
-                "investors": df.iloc[0].get('number_of_investors', 0),
-                "ret_1w": calc_return_by_days(7),
-                "ret_1m": calc_return_by_months(1),
-                "ret_3m": calc_return_by_months(3),
-                "ret_6m": calc_return_by_months(6),
-                "ret_ybd": calc_return_by_months((guncel_tarih.month - 1)),
-                "ret_1y": calc_return_by_months(12),
-                "ret_3y": calc_return_by_months(36),
-                "ret_5y": calc_return_by_months(60)
-            }
-    except Exception as e:
-        print(f"TEFAS Hata: {e}")
+    bugun = datetime.now()
+    baslangic = (bugun - timedelta(days=30)).strftime("%Y-%m-%d")
+    data = fetch_tefas_raw(fon_kodu, baslangic, bugun.strftime("%Y-%m-%d"))
+    if data:
+        last_item = data[-1]
+        raw_date = datetime.fromtimestamp(int(last_item['TARIH']) / 1000).strftime("%Y-%m-%d")
+        return {
+            "code": fon_kodu.upper(),
+            "title": last_item.get('FONUNVAN', fon_kodu.upper()),
+            "price": float(last_item['FIYAT']),
+            "date": raw_date,
+            "market_cap": last_item.get('PORTFOYBUYUKLUK', 0),
+            "investors": last_item.get('KISISAYISI', 0)
+        }
     return None
 
 # ==================== HTML ŞABLONLARI ====================
@@ -193,7 +175,6 @@ MAIN_TEMPLATE = """<!DOCTYPE html>
     </div>
   </header>
 
-  <!-- Özet Kartları -->
   <div class="grid grid-cols-1 sm:grid-cols-4 gap-4 mb-8">
     <div class="glass-card rounded-2xl p-5"><span class="text-xs font-semibold text-slate-400 uppercase">Toplam Değer</span><h3 class="text-2xl font-bold" id="toplamDeger">0.00 ₺</h3></div>
     <div class="glass-card rounded-2xl p-5"><span class="text-xs font-semibold text-slate-400 uppercase">Anapara</span><h3 class="text-2xl font-bold" id="toplamMaliyet">0.00 ₺</h3></div>
@@ -201,7 +182,6 @@ MAIN_TEMPLATE = """<!DOCTYPE html>
     <div class="glass-card rounded-2xl p-5"><span class="text-xs font-semibold text-slate-400 uppercase">Kâr Oranı</span><h3 class="text-2xl font-bold" id="toplamKarYuzde">%0.00</h3></div>
   </div>
 
-  <!-- İşlem Formu -->
   <div class="glass-card rounded-2xl p-6 mb-8">
     <h2 class="text-lg font-bold mb-4">Yeni İşlem Ekle</h2>
     <form id="islemForm" onsubmit="islemEkle(event)" class="grid grid-cols-1 sm:grid-cols-12 gap-4">
@@ -214,7 +194,6 @@ MAIN_TEMPLATE = """<!DOCTYPE html>
     </form>
   </div>
 
-  <!-- Portföy Tablosu -->
   <div class="glass-card rounded-2xl p-6 mb-8 overflow-x-auto">
     <h2 class="text-lg font-bold mb-4">Fon Varlıkları</h2>
     <table class="w-full text-left text-sm">
@@ -344,7 +323,6 @@ ADMIN_TEMPLATE = """<!DOCTYPE html>
       <h1 class="text-2xl font-extrabold">Admin Yönetim Paneli</h1>
       <a href="/" class="px-4 py-2 bg-slate-800 hover:bg-slate-700 rounded-xl text-xs font-bold">Arayüze Dön</a>
     </div>
-    
     <div class="bg-[#151c28] border border-slate-800 rounded-2xl p-6 shadow-xl">
       <h2 class="text-lg font-bold mb-4">Kayıtlı Kullanıcılar ({{ users|length }})</h2>
       <table class="w-full text-left text-sm">

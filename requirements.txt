@@ -2,7 +2,5 @@ Flask
 Flask-SQLAlchemy
 Flask-Login
 Flask-CORS
-tefas
-webdriver-manager
 gunicorn
-werkzeug
+requests
