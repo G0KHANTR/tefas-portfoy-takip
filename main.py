@@ -1,262 +1,375 @@
-from flask import Flask, jsonify, request, render_template_string, redirect, url_for, flash
-from flask_sqlalchemy import SQLAlchemy
-from flask_login import LoginManager, UserMixin, login_user, login_required, logout_user, current_user
-from werkzeug.security import generate_password_hash, check_password_hash
-from flask_cors import CORS
 from datetime import datetime, timedelta
-import requests
-import os
+import calendar
+from flask import Flask, jsonify, request, render_template_string
+from flask_cors import CORS
+from tefas import Crawler
 
 app = Flask(__name__)
-app.config['SECRET_KEY'] = 'gizli-anahtar-buraya-gelecek-12345'
-app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///tefas_portfoy.db'
-app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-
-db = SQLAlchemy(app)
-login_manager = LoginManager(app)
-login_manager.login_view = 'login'
 CORS(app)
 
-# ==================== VERİTABANI MODELLERİ ====================
-
-class User(UserMixin, db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    username = db.Column(db.String(80), unique=True, nullable=False)
-    password_hash = db.Column(db.String(200), nullable=False)
-    is_admin = db.Column(db.Boolean, default=False)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
-    transactions = db.relationship('Transaction', backref='user', lazy=True, cascade="all, delete-orphan")
-
-    def set_password(self, password):
-        self.password_hash = generate_password_hash(password)
-
-    def check_password(self, password):
-        return check_password_hash(self.password_hash, password)
-
-class Transaction(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
-    tarih = db.Column(db.String(10), nullable=False)
-    kod = db.Column(db.String(10), nullable=False)
-    tip = db.Column(db.String(5), nullable=False)
-    adet = db.Column(db.Float, nullable=False)
-    fiyat = db.Column(db.Float, nullable=False)
-
-@login_manager.user_loader
-def load_user(user_id):
-    return User.query.get(int(user_id))
-
-with app.app_context():
-    db.create_all()
-    if not User.query.filter_by(username='admin').first():
-        admin = User(username='admin', is_admin=True)
-        admin.set_password('admin123')
-        db.session.add(admin)
-        db.session.commit()
-
-# ==================== TEFAS VERİ ÇEKME MOTORU (GÜNCELLENDİ) ====================
-
-def fetch_tefas_raw(fon_kodu, start_date, end_date):
-    url = "https://www.tefas.gov.tr/api/DB/BindHistoryInfo"
-    
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Accept": "application/json, text/javascript, */*; q=0.01",
-        "Accept-Language": "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-        "X-Requested-With": "XMLHttpRequest",
-        "Origin": "https://www.tefas.gov.tr",
-        "Referer": "https://www.tefas.gov.tr/TarihselVeriler.aspx",
-        "Sec-Fetch-Dest": "empty",
-        "Sec-Fetch-Mode": "cors",
-        "Sec-Fetch-Site": "same-origin",
-        "Connection": "keep-alive"
-    }
-    
-    start_dt = datetime.strptime(start_date, "%Y-%m-%d").strftime("%m/%d/%Y")
-    end_dt = datetime.strptime(end_date, "%Y-%m-%d").strftime("%m/%d/%Y")
-    
-    payload = {
-        "fontType": "YAT",
-        "startDate": start_dt,
-        "endDate": end_dt,
-        "fontKod": fon_kodu.upper()
-    }
-    
-    try:
-        session = requests.Session()
-        # TEFAS Güvenlik Duvarı için Oturum Başlatma ve Çerez Alımı
-        session.get("https://www.tefas.gov.tr/TarihselVeriler.aspx", headers=headers, timeout=10)
-        
-        r = session.post(url, headers=headers, data=payload, timeout=10)
-        if r.status_code == 200:
-            res = r.json()
-            return res.get('data', [])
-    except Exception as e:
-        print(f"TEFAS Istek Hatasi: {e}")
-    return []
+crawler = Crawler()
 
 def get_tefas_price_on_date(fon_kodu, hedef_tarih_str):
-    hedef_tarih = datetime.strptime(hedef_tarih_str, "%Y-%m-%d")
-    baslangic = (hedef_tarih - timedelta(days=15)).strftime("%Y-%m-%d")
-    data = fetch_tefas_raw(fon_kodu, baslangic, hedef_tarih_str)
-    if data:
-        last_item = data[-1]
-        raw_date = datetime.fromtimestamp(int(last_item['TARIH']) / 1000).strftime("%Y-%m-%d")
-        return {"price": float(last_item['FIYAT']), "date": raw_date}
+    try:
+        hedef_tarih = datetime.strptime(hedef_tarih_str, "%Y-%m-%d")
+        baslangic = hedef_tarih - timedelta(days=45)
+        
+        df = crawler.fetch(
+            start=baslangic.strftime("%Y-%m-%d"),
+            end=hedef_tarih.strftime("%Y-%m-%d"),
+            name=fon_kodu.upper()
+        )
+        
+        if df is not None and not df.empty:
+            df['date'] = df['date'].astype(str)
+            df = df.sort_values(by='date', ascending=False)
+            
+            gecmis_df = df[df['date'] <= hedef_tarih_str]
+            if not gecmis_df.empty:
+                bulunan_fiyat = float(gecmis_df.iloc[0]['price'])
+                bulunan_tarih = gecmis_df.iloc[0]['date']
+                return {"price": round(bulunan_fiyat, 6), "date": bulunan_tarih}
+    except Exception as e:
+        print(f"Tarihli Fiyat Çekme Hatası ({fon_kodu} - {hedef_tarih_str}): {e}")
     return None
 
 def get_tefas_data_crawler(fon_kodu):
-    bugun = datetime.now()
-    baslangic = (bugun - timedelta(days=15)).strftime("%Y-%m-%d")
-    data = fetch_tefas_raw(fon_kodu, baslangic, bugun.strftime("%Y-%m-%d"))
-    if data:
-        last_item = data[-1]
-        raw_date = datetime.fromtimestamp(int(last_item['TARIH']) / 1000).strftime("%Y-%m-%d")
-        return {
-            "code": fon_kodu.upper(),
-            "title": last_item.get('FONUNVAN', fon_kodu.upper()),
-            "price": float(last_item['FIYAT']),
-            "date": raw_date,
-            "market_cap": last_item.get('PORTFOYBUYUKLUK', 0),
-            "investors": last_item.get('KISISAYISI', 0)
-        }
+    try:
+        bugun = datetime.now()
+        baslangic = bugun - timedelta(days=1850)
+        
+        df = crawler.fetch(
+            start=baslangic.strftime("%Y-%m-%d"),
+            end=bugun.strftime("%Y-%m-%d"),
+            name=fon_kodu.upper()
+        )
+        
+        if df is not None and not df.empty:
+            df['date'] = df['date'].astype(str)
+            df = df.sort_values(by='date', ascending=False)
+            
+            guncel_fiyat = float(df.iloc[0]['price'])
+            guncel_tarih_str = df.iloc[0]['date']
+            guncel_tarih = datetime.strptime(guncel_tarih_str, "%Y-%m-%d")
+
+            def get_price_for_target(year, month, day):
+                max_days = calendar.monthrange(year, month)[1]
+                target_day = min(day, max_days)
+                tarih_str = f"{year:04d}-{month:02d}-{target_day:02d}"
+                gecmis_df = df[df['date'] <= tarih_str]
+                if not gecmis_df.empty:
+                    return float(gecmis_df.iloc[0]['price'])
+                return None
+
+            def calc_return_by_months(months_back):
+                year = guncel_tarih.year
+                month = guncel_tarih.month - months_back
+                while month <= 0:
+                    month += 12
+                    year -= 1
+                old_p = get_price_for_target(year, month, guncel_tarih.day)
+                if old_p and old_p > 0:
+                    return round(((guncel_fiyat - old_p) / old_p) * 100, 2)
+                return None
+
+            def calc_return_by_days(days_back):
+                tarih_str = (guncel_tarih - timedelta(days=days_back)).strftime("%Y-%m-%d")
+                gecmis_df = df[df['date'] <= tarih_str]
+                if not gecmis_df.empty:
+                    old_p = float(gecmis_df.iloc[0]['price'])
+                    if old_p > 0:
+                        return round(((guncel_fiyat - old_p) / old_p) * 100, 2)
+                return None
+
+            def calc_ybd_return():
+                tarih_str = f"{guncel_tarih.year - 1}-12-31"
+                gecmis_df = df[df['date'] <= tarih_str]
+                if not gecmis_df.empty:
+                    old_p = float(gecmis_df.iloc[0]['price'])
+                    if old_p > 0:
+                        return round(((guncel_fiyat - old_p) / old_p) * 100, 2)
+                return None
+
+            title = df.iloc[0].get('title', fon_kodu.upper())
+
+            return {
+                "code": fon_kodu.upper(),
+                "title": title,
+                "price": round(guncel_fiyat, 6),
+                "date": guncel_tarih_str,
+                "ret_1w": calc_return_by_days(7),
+                "ret_1m": calc_return_by_months(1),
+                "ret_3m": calc_return_by_months(3),
+                "ret_6m": calc_return_by_months(6),
+                "ret_ybd": calc_ybd_return(),
+                "ret_1y": calc_return_by_months(12),
+                "ret_3y": calc_return_by_months(36),
+                "ret_5y": calc_return_by_months(60)
+            }
+    except Exception as e:
+        print(f"TEFAS Crawler Hatası ({fon_kodu}): {e}")
     return None
 
-# ==================== HTML ŞABLONLARI ====================
-
-AUTH_TEMPLATE = """<!DOCTYPE html>
+HTML_TEMPLATE = """<!DOCTYPE html>
 <html lang="tr" class="dark">
 <head>
-  <meta charset="UTF-8"><title>{{ title }} - TEFAS Portföy</title>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>TEFAS Portföy Takip & Analiz</title>
   <script src="https://cdn.tailwindcss.com"></script>
-  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;600;800&display=swap" rel="stylesheet">
-</head>
-<body class="bg-[#0b0f17] text-white font-['Plus_Jakarta_Sans'] min-h-screen flex items-center justify-center p-4">
-  <div class="max-w-md w-full bg-[#151c28] border border-slate-800 rounded-2xl p-8 shadow-2xl">
-    <div class="flex justify-between items-center mb-6">
-      <h2 class="text-2xl font-extrabold">{{ title }}</h2>
-      <a href="/" class="text-xs text-slate-400 hover:text-white">← Ana Sayfa</a>
-    </div>
-    {% with messages = get_flashed_messages() %}
-      {% if messages %}
-        {% for msg in messages %}<div class="bg-rose-500/10 border border-rose-500/20 text-rose-400 p-3 rounded-xl mb-4 text-xs">{{ msg }}</div>{% endfor %}
-      {% endif %}
-    {% endwith %}
-    <form method="POST" class="space-y-4">
-      <div>
-        <label class="block text-xs font-semibold text-slate-400 uppercase mb-2">Kullanıcı Adı</label>
-        <input type="text" name="username" class="w-full bg-[#1a2332] border border-slate-700/60 rounded-xl px-4 py-2.5 text-sm text-white focus:outline-none focus:border-blue-500" required>
-      </div>
-      <div>
-        <label class="block text-xs font-semibold text-slate-400 uppercase mb-2">Parola</label>
-        <input type="password" name="password" class="w-full bg-[#1a2332] border border-slate-700/60 rounded-xl px-4 py-2.5 text-sm text-white focus:outline-none focus:border-blue-500" required>
-      </div>
-      <button type="submit" class="w-full py-3 bg-blue-600 hover:bg-blue-500 rounded-xl font-bold text-sm transition-all">{{ button_text }}</button>
-    </form>
-    <div class="mt-6 text-center text-xs text-slate-400">
-      {% if is_login %} Hesabınız yok mu? <a href="/register" class="text-blue-400 hover:underline">Kayıt Ol</a>
-      {% else %} Zaten hesabınız var mı? <a href="/login" class="text-blue-400 hover:underline">Giriş Yap</a> {% endif %}
-    </div>
-  </div>
-</body>
-</html>"""
-
-MAIN_TEMPLATE = """<!DOCTYPE html>
-<html lang="tr" class="dark">
-<head>
-  <meta charset="UTF-8"><title>TEFAS Portföy Takip</title>
-  <script src="https://cdn.tailwindcss.com"></script>
-  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;600;800&display=swap" rel="stylesheet">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          fontFamily: {
+            sans: ['"Plus Jakarta Sans"', 'sans-serif'],
+          },
+          colors: {
+            dark: {
+              bg: '#0b0f17',
+              card: '#151c28',
+              border: '#222d3d',
+              input: '#1a2332'
+            }
+          }
+        }
+      }
+    }
+  </script>
   <style>
     body { background-color: #0b0f17; color: #f1f5f9; font-family: 'Plus Jakarta Sans', sans-serif; }
-    .glass-card { background: rgba(21, 28, 40, 0.75); backdrop-filter: blur(16px); border: 1px solid rgba(255, 255, 255, 0.08); }
-    .pos { color: #10b981; font-weight: 700; } .neg { color: #f43f5e; font-weight: 700; }
+    .glass-card {
+      background: rgba(21, 28, 40, 0.75);
+      backdrop-filter: blur(16px);
+      -webkit-backdrop-filter: blur(16px);
+      border: 1px solid rgba(255, 255, 255, 0.08);
+    }
+    .pos { color: #10b981; font-weight: 700; }
+    .neg { color: #f43f5e; font-weight: 700; }
+    .draggable-modal {
+      position: fixed;
+      z-index: 1000;
+      top: 100px;
+      left: calc(50% - 280px);
+      width: 560px;
+      max-width: 95vw;
+    }
   </style>
 </head>
-<body class="min-h-screen pb-12">
-<div class="max-w-7xl mx-auto px-4 pt-8">
-  <header class="flex justify-between items-center mb-8">
-    <div class="flex items-center gap-3">
-      <div class="w-10 h-10 rounded-xl bg-blue-600 flex items-center justify-center font-extrabold text-xl">T</div>
-      <div>
-        <h1 class="text-2xl font-extrabold">TEFAS <span class="text-blue-400">Portföy Takip</span></h1>
-        {% if current_user.is_authenticated %}
-        <p class="text-xs text-slate-400">Hoş geldin, <span class="text-white font-bold">{{ current_user.username }}</span></p>
-        {% else %}
-        <p class="text-xs text-slate-400">Yatırım Fonları Takip Platformu</p>
-        {% endif %}
+<body class="min-h-screen pb-12 antialiased">
+
+<div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 pt-8">
+  
+  <!-- Header -->
+  <header class="flex flex-col md:flex-row justify-between items-start md:items-center gap-4 mb-8">
+    <div>
+      <div class="flex items-center gap-3">
+        <div class="w-10 h-10 rounded-xl bg-gradient-to-tr from-blue-600 to-indigo-500 flex items-center justify-center shadow-lg shadow-blue-500/20 text-white font-extrabold text-xl">
+          T
+        </div>
+        <div>
+          <h1 class="text-2xl font-extrabold text-white tracking-tight">TEFAS <span class="text-transparent bg-clip-text bg-gradient-to-r from-blue-400 to-indigo-400">Portföy Takip</span></h1>
+          <p class="text-xs text-slate-400 font-medium">Canlı Piyasa ve Kişisel Varlık Analizi</p>
+        </div>
       </div>
     </div>
-    <div class="flex items-center gap-3">
-      {% if current_user.is_authenticated %}
-        {% if current_user.is_admin %}
-        <a href="/admin" class="px-4 py-2 bg-purple-600/20 hover:bg-purple-600/30 border border-purple-500/30 text-purple-400 rounded-xl text-xs font-bold transition-all">Admin Paneli</a>
-        {% endif %}
-        <a href="/logout" class="px-4 py-2 bg-rose-500/10 hover:bg-rose-500/20 border border-rose-500/30 text-rose-400 rounded-xl text-xs font-bold transition-all">Çıkış Yap</a>
-      {% else %}
-        <a href="/login" class="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-white rounded-xl text-xs font-bold transition-all">Giriş Yap</a>
-        <a href="/register" class="px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white rounded-xl text-xs font-bold transition-all">Kayıt Ol</a>
-      {% endif %}
-    </div>
+    <button onclick="portfoyuGuncelle()" class="inline-flex items-center gap-2 px-4 py-2.5 rounded-xl bg-slate-800/80 hover:bg-slate-700/80 text-blue-400 border border-slate-700/50 text-sm font-semibold transition-all shadow-sm active:scale-95">
+      <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
+      Fiyatları Canlı Güncelle
+    </button>
   </header>
 
-  {% if not current_user.is_authenticated %}
-  <div class="glass-card rounded-2xl p-8 mb-8 text-center border border-blue-500/30">
-    <h2 class="text-2xl font-extrabold mb-2">Portföyünüzü Takip Etmeye Başlayın</h2>
-    <p class="text-sm text-slate-400 mb-6 max-w-xl mx-auto">İşlem yapmak, canlı TEFAS fiyatları üzerinden kâr/zarar hesabı tutmak ve alım-satım kayıtlarınızı yönetmek için giriş yapın veya ücretsiz hesap oluşturun.</p>
-    <div class="flex justify-center gap-4">
-      <a href="/login" class="px-6 py-3 bg-blue-600 hover:bg-blue-500 rounded-xl font-bold text-sm">Giriş Yap</a>
-      <a href="/register" class="px-6 py-3 bg-slate-800 hover:bg-slate-700 rounded-xl font-bold text-sm">Ücretsiz Kayıt Ol</a>
+  <!-- Özet Kartları -->
+  <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
+    <div class="glass-card rounded-2xl p-5 shadow-lg">
+      <div class="flex justify-between items-center mb-2">
+        <span class="text-xs font-semibold uppercase tracking-wider text-slate-400">Toplam Portföy Değeri</span>
+        <div class="p-2 rounded-lg bg-blue-500/10 text-blue-400">
+          <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.599 1M12 8V7m0 1v8m0 0v1m0-1c-1.11 0-2.08-.402-2.599-1M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
+        </div>
+      </div>
+      <h3 class="text-2xl font-bold text-white" id="toplamDeger">0.00 ₺</h3>
+    </div>
+
+    <div class="glass-card rounded-2xl p-5 shadow-lg">
+      <div class="flex justify-between items-center mb-2">
+        <span class="text-xs font-semibold uppercase tracking-wider text-slate-400">Yatırılan Anapara</span>
+        <div class="p-2 rounded-lg bg-indigo-500/10 text-indigo-400">
+          <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 10h18M7 15h1m4 0h1m-7 4h12a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z"/></svg>
+        </div>
+      </div>
+      <h3 class="text-2xl font-bold text-white" id="toplamMaliyet">0.00 ₺</h3>
+    </div>
+
+    <div class="glass-card rounded-2xl p-5 shadow-lg">
+      <div class="flex justify-between items-center mb-2">
+        <span class="text-xs font-semibold uppercase tracking-wider text-slate-400">Toplam Kâr / Zarar</span>
+        <div class="p-2 rounded-lg bg-emerald-500/10 text-emerald-400">
+          <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 7h8m0 0v8m0-8l-8 8-4-4-6 6"/></svg>
+        </div>
+      </div>
+      <h3 class="text-2xl font-bold text-slate-300" id="toplamKar">0.00 ₺</h3>
+    </div>
+
+    <div class="glass-card rounded-2xl p-5 shadow-lg">
+      <div class="flex justify-between items-center mb-2">
+        <span class="text-xs font-semibold uppercase tracking-wider text-slate-400">Toplam Kâr Oranı</span>
+        <div class="p-2 rounded-lg bg-purple-500/10 text-purple-400">
+          <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"/></svg>
+        </div>
+      </div>
+      <h3 class="text-2xl font-bold text-slate-300" id="toplamKarYuzde">%0.00</h3>
     </div>
   </div>
-  {% else %}
 
-  <div class="grid grid-cols-1 sm:grid-cols-4 gap-4 mb-8">
-    <div class="glass-card rounded-2xl p-5"><span class="text-xs font-semibold text-slate-400 uppercase">Toplam Değer</span><h3 class="text-2xl font-bold" id="toplamDeger">0.00 ₺</h3></div>
-    <div class="glass-card rounded-2xl p-5"><span class="text-xs font-semibold text-slate-400 uppercase">Anapara</span><h3 class="text-2xl font-bold" id="toplamMaliyet">0.00 ₺</h3></div>
-    <div class="glass-card rounded-2xl p-5"><span class="text-xs font-semibold text-slate-400 uppercase">Net Kâr / Zarar</span><h3 class="text-2xl font-bold" id="toplamKar">0.00 ₺</h3></div>
-    <div class="glass-card rounded-2xl p-5"><span class="text-xs font-semibold text-slate-400 uppercase">Kâr Oranı</span><h3 class="text-2xl font-bold" id="toplamKarYuzde">%0.00</h3></div>
-  </div>
+  <!-- İşlem Formu -->
+  <div class="glass-card rounded-2xl p-6 shadow-xl mb-8">
+    <h2 class="text-lg font-bold text-white mb-4 flex items-center gap-2">
+      <span class="w-2 h-2 rounded-full bg-blue-500"></span> Yeni İşlem Ekle
+    </h2>
+    <form id="islemForm" onsubmit="islemEkle(event)" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-12 gap-4">
+      <div class="lg:col-span-2">
+        <label class="block text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2">İşlem Tarihi</label>
+        <input type="date" id="islemTarih" class="w-full bg-dark-input border border-slate-700/60 rounded-xl px-3.5 py-2.5 text-sm text-white focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 transition-all" required>
+      </div>
 
-  <div class="glass-card rounded-2xl p-6 mb-8">
-    <h2 class="text-lg font-bold mb-4">Yeni İşlem Ekle</h2>
-    <form id="islemForm" onsubmit="islemEkle(event)" class="grid grid-cols-1 sm:grid-cols-12 gap-4">
-      <div class="sm:col-span-2"><label class="block text-xs text-slate-400 mb-1">Tarih</label><input type="date" id="islemTarih" class="w-full bg-[#1a2332] border border-slate-700/60 rounded-xl px-3 py-2 text-sm" required></div>
-      <div class="sm:col-span-2"><label class="block text-xs text-slate-400 mb-1">Fon Kodu</label><input type="text" id="islemKod" class="w-full bg-[#1a2332] border border-slate-700/60 rounded-xl px-3 py-2 text-sm uppercase" placeholder="MAC" required></div>
-      <div class="sm:col-span-2"><label class="block text-xs text-slate-400 mb-1">Tip</label><select id="islemTip" class="w-full bg-[#1a2332] border border-slate-700/60 rounded-xl px-3 py-2 text-sm"><option value="AL">Alım</option><option value="SAT">Satım</option></select></div>
-      <div class="sm:col-span-2"><label class="block text-xs text-slate-400 mb-1">Adet</label><input type="number" step="0.000001" id="islemAdet" class="w-full bg-[#1a2332] border border-slate-700/60 rounded-xl px-3 py-2 text-sm" required></div>
-      <div class="sm:col-span-2"><label class="block text-xs text-slate-400 mb-1">Birim Fiyat (₺)</label><input type="number" step="0.000001" id="islemFiyat" class="w-full bg-[#1a2332] border border-slate-700/60 rounded-xl px-3 py-2 text-sm" placeholder="Otomatik"></div>
-      <div class="sm:col-span-2 flex items-end"><button type="submit" id="kaydetBtn" class="w-full py-2 bg-blue-600 hover:bg-blue-500 rounded-xl font-bold text-sm">Kaydet</button></div>
+      <div class="lg:col-span-2">
+        <label class="block text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2">Fon Kodu</label>
+        <input type="text" id="islemKod" class="w-full bg-dark-input border border-slate-700/60 rounded-xl px-3.5 py-2.5 text-sm text-white uppercase placeholder-slate-500 focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 transition-all" placeholder="Örn: MAC" required>
+      </div>
+
+      <div class="lg:col-span-2">
+        <label class="block text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2">İşlem Tipi</label>
+        <select id="islemTip" class="w-full bg-dark-input border border-slate-700/60 rounded-xl px-3.5 py-2.5 text-sm text-white focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 transition-all">
+          <option value="AL">Alım</option>
+          <option value="SAT">Satım</option>
+        </select>
+      </div>
+
+      <div class="lg:col-span-2">
+        <label class="block text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2">Adet</label>
+        <input type="number" step="0.000001" id="islemAdet" class="w-full bg-dark-input border border-slate-700/60 rounded-xl px-3.5 py-2.5 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 transition-all" placeholder="0.00" required>
+      </div>
+
+      <div class="lg:col-span-2">
+        <label class="block text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2">Birim Fiyat (₺)</label>
+        <input type="number" step="0.000001" id="islemFiyat" class="w-full bg-dark-input border border-slate-700/60 rounded-xl px-3.5 py-2.5 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 transition-all" placeholder="Otomatik Fiyat">
+      </div>
+
+      <div class="lg:col-span-2 flex items-end">
+        <button type="submit" id="kaydetBtn" class="w-full py-2.5 px-4 bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 text-white font-bold text-sm rounded-xl shadow-lg shadow-blue-600/25 transition-all active:scale-95">
+          İşlemi Kaydet
+        </button>
+      </div>
     </form>
   </div>
 
-  <div class="glass-card rounded-2xl p-6 mb-8 overflow-x-auto">
-    <h2 class="text-lg font-bold mb-4">Fon Varlıkları</h2>
-    <table class="w-full text-left text-sm">
-      <thead>
-        <tr class="border-b border-slate-700 text-xs text-slate-400 uppercase">
-          <th class="pb-3">Fon Kodu</th><th class="pb-3">Adet</th><th class="pb-3">Ort. Maliyet</th><th class="pb-3">Anlık Fiyat</th><th class="pb-3">Toplam Değer</th><th class="pb-3">Kâr / Zarar</th><th class="pb-3">Kâr (%)</th>
-        </tr>
-      </thead>
-      <tbody id="portfoyTablosu" class="divide-y divide-slate-800"></tbody>
-    </table>
+  <!-- Portföy Tablosu -->
+  <div class="glass-card rounded-2xl p-6 shadow-xl mb-8 overflow-hidden">
+    <div class="flex justify-between items-center mb-6">
+      <h2 class="text-lg font-bold text-white flex items-center gap-2">
+        <span class="w-2 h-2 rounded-full bg-indigo-500"></span> Mevcut Fon Varlıkları
+      </h2>
+      <span class="text-xs text-slate-400 font-medium">Fon koduna tıklayarak TEFAS detaylarını görebilirsiniz</span>
+    </div>
+    <div class="overflow-x-auto">
+      <table class="w-full text-left text-sm border-collapse">
+        <thead>
+          <tr class="border-b border-slate-700/60 text-xs font-bold uppercase tracking-wider text-slate-400">
+            <th class="pb-3 px-3">Fon Kodu</th>
+            <th class="pb-3 px-3">Adet</th>
+            <th class="pb-3 px-3">Ort. Maliyet</th>
+            <th class="pb-3 px-3">Anlık Fiyat</th>
+            <th class="pb-3 px-3">Toplam Değer</th>
+            <th class="pb-3 px-3">Net Kâr / Zarar (₺)</th>
+            <th class="pb-3 px-3">Maliyete Göre Kâr (%)</th>
+            <th class="pb-3 px-3">Tutma Süresi</th>
+          </tr>
+        </thead>
+        <tbody id="portfoyTablosu" class="divide-y divide-slate-800/60 text-slate-200">
+        </tbody>
+      </table>
+    </div>
   </div>
-  {% endif %}
+
+  <!-- Geçmiş İşlem Kayıtları -->
+  <div class="glass-card rounded-2xl p-6 shadow-xl">
+    <h2 class="text-lg font-bold text-white mb-4 flex items-center gap-2">
+      <span class="w-2 h-2 rounded-full bg-purple-500"></span> Geçmiş İşlem Kayıtları
+    </h2>
+    <div id="gecmisQuotes" class="space-y-3"></div>
+  </div>
+
 </div>
 
-{% if current_user.is_authenticated %}
+<!-- Sürüklenebilir TEFAS Modal -->
+<div id="tefasModal" class="hidden draggable-modal glass-card rounded-2xl shadow-2xl border border-slate-700/80 overflow-hidden">
+  <div id="modalHeader" class="bg-slate-800/90 px-6 py-4 flex justify-between items-center cursor-move border-b border-slate-700/60">
+    <div class="flex items-center gap-2">
+      <span class="w-2.5 h-2.5 rounded-full bg-blue-500 animate-pulse"></span>
+      <h3 class="font-bold text-white text-base" id="modalFonBaslik">Fon Detayları</h3>
+    </div>
+    <button onclick="tefasModalKapat()" class="text-slate-400 hover:text-white p-1 rounded-lg hover:bg-slate-700/50 transition-all">
+      <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/></svg>
+    </button>
+  </div>
+  <div class="p-6">
+    <p class="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-4">TEFAS Resmi Dönemsel Getirileri (%):</p>
+    <div class="grid grid-cols-2 sm:grid-cols-4 gap-3 text-center mb-3">
+      <div class="bg-dark-input p-3 rounded-xl border border-slate-700/50">
+        <span class="block text-xs text-slate-400 font-medium mb-1">Son 1 Hafta</span>
+        <div id="m_ret_1w" class="text-sm font-bold">-</div>
+      </div>
+      <div class="bg-dark-input p-3 rounded-xl border border-slate-700/50">
+        <span class="block text-xs text-slate-400 font-medium mb-1">Son 1 Ay</span>
+        <div id="m_ret_1m" class="text-sm font-bold">-</div>
+      </div>
+      <div class="bg-dark-input p-3 rounded-xl border border-slate-700/50">
+        <span class="block text-xs text-slate-400 font-medium mb-1">Son 3 Ay</span>
+        <div id="m_ret_3m" class="text-sm font-bold">-</div>
+      </div>
+      <div class="bg-dark-input p-3 rounded-xl border border-slate-700/50">
+        <span class="block text-xs text-slate-400 font-medium mb-1">Son 6 Ay</span>
+        <div id="m_ret_6m" class="text-sm font-bold">-</div>
+      </div>
+    </div>
+    <div class="grid grid-cols-2 sm:grid-cols-4 gap-3 text-center">
+      <div class="bg-dark-input p-3 rounded-xl border border-slate-700/50">
+        <span class="block text-xs text-slate-400 font-medium mb-1">Yılbaşı (YBD)</span>
+        <div id="m_ret_ybd" class="text-sm font-bold">-</div>
+      </div>
+      <div class="bg-dark-input p-3 rounded-xl border border-slate-700/50">
+        <span class="block text-xs text-slate-400 font-medium mb-1">Son 1 Yıl</span>
+        <div id="m_ret_1y" class="text-sm font-bold">-</div>
+      </div>
+      <div class="bg-dark-input p-3 rounded-xl border border-slate-700/50">
+        <span class="block text-xs text-slate-400 font-medium mb-1">Son 3 Yıl</span>
+        <div id="m_ret_3y" class="text-sm font-bold">-</div>
+      </div>
+      <div class="bg-dark-input p-3 rounded-xl border border-slate-700/50">
+        <span class="block text-xs text-slate-400 font-medium mb-1">Son 5 Yıl</span>
+        <div id="m_ret_5y" class="text-sm font-bold">-</div>
+      </div>
+    </div>
+  </div>
+</div>
+
 <script>
-  let dbIslemler = [];
+  let islemler = JSON.parse(localStorage.getItem('tefas_islemler')) || [];
   let tefasFiyatlar = {};
 
   document.getElementById('islemTarih').valueAsDate = new Date();
-  function formatMoney(n) { return (Math.round(n * 100) / 100).toLocaleString('tr-TR', { minimumFractionDigits: 2 }); }
 
-  async function verileriYukle() {
-    const res = await fetch('/api/user_transactions');
-    dbIslemler = await res.json();
-    await portfoyuGuncelle();
+  function formatMoney(num) {
+    return (Math.round(num * 100) / 100).toLocaleString('tr-TR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  }
+
+  function formatPercent(num) {
+    return (Math.round(num * 100) / 100).toFixed(2);
   }
 
   async function islemEkle(e) {
@@ -269,330 +382,278 @@ MAIN_TEMPLATE = """<!DOCTYPE html>
     let fiyat = parseFloat(document.getElementById("islemFiyat").value);
 
     if (!fiyat || isNaN(fiyat)) {
-      btn.innerText = "Fiyat Alınıyor...";
+      btn.innerText = "Fiyat Çekiliyor...";
       btn.disabled = true;
       try {
         const res = await fetch(`/api/fon_tarihli_fiyat?kod=${kod}&tarih=${tarih}`);
         const data = await res.json();
         if (data.status === 'success') {
           fiyat = data.data.price;
-        } else { 
-          alert("Fiyat TEFAS sisteminden alınamadı. Lütfen birim fiyatı manuel olarak girin."); 
-          btn.innerText = "Kaydet"; 
-          btn.disabled = false; 
-          return; 
+        } else {
+          alert("Seçilen tarihe ait TEFAS fiyatı bulunamadı. Lütfen elle fiyat giriniz.");
+          btn.innerText = "İşlemi Kaydet";
+          btn.disabled = false;
+          return;
         }
-      } catch (err) {
-        alert("Bağlantı hatası oluştu. Lütfen elle fiyat girin.");
-        btn.innerText = "Kaydet"; 
+      } catch(err) {
+        alert("Veri bağlantı hatası oluştu.");
+        btn.innerText = "İşlemi Kaydet";
         btn.disabled = false;
         return;
       }
+      btn.innerText = "İşlemi Kaydet";
+      btn.disabled = false;
     }
 
-    await fetch('/api/add_transaction', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ tarih, kod, tip, adet, fiyat })
-    });
-
+    const yeniIslem = { id: Date.now(), tarih, kod, tip, adet, fiyat };
+    islemler.push(yeniIslem);
+    localStorage.setItem('tefas_islemler', JSON.stringify(islemler));
     document.getElementById("islemForm").reset();
     document.getElementById('islemTarih').valueAsDate = new Date();
-    btn.innerText = "Kaydet"; btn.disabled = false;
-    verileriYukle();
+    portfoyuGuncelle();
+  }
+
+  function islemSil(id) {
+    islemler = islemler.filter(x => x.id !== id);
+    localStorage.setItem('tefas_islemler', JSON.stringify(islemler));
+    portfoyuGuncelle();
   }
 
   async function portfoyuGuncelle() {
-    const fonKodlari = [...new Set(dbIslemler.map(x => x.kod))];
+    const fonKodlari = [...new Set(islemler.map(x => x.kod))];
+    const tbody = document.getElementById("portfoyTablosu");
+    
+    if (fonKodlari.length > 0) {
+      tbody.innerHTML = `<tr><td colspan="8" class="text-slate-400 text-center py-6">TEFAS güncel verileri çekiliyor...</td></tr>`;
+    }
+
     for (const kod of fonKodlari) {
       try {
         const res = await fetch(`/api/fon?kod=${kod}`);
         const data = await res.json();
-        if (data.status === 'success') tefasFiyatlar[kod] = data.data;
-      } catch (e) {}
+        if (data.status === 'success') {
+          tefasFiyatlar[kod] = data.data;
+        }
+      } catch(e) { console.error(e); }
     }
-    tabloCiz();
+
+    tablolariCiz();
   }
 
-  function tabloCiz() {
+  function tefasModalAc(kod) {
+    const data = tefasFiyatlar[kod];
+    if (data) {
+      document.getElementById("modalFonBaslik").innerText = `${data.code} - ${data.title || ''}`;
+      
+      const fmt = (val) => {
+        if (val === null || val === undefined) return `<span class="text-slate-500">-</span>`;
+        return `<span class="${val >= 0 ? 'pos' : 'neg'}">%${val > 0 ? '+' : ''}${formatPercent(val)}</span>`;
+      };
+      
+      document.getElementById("m_ret_1w").innerHTML = fmt(data.ret_1w);
+      document.getElementById("m_ret_1m").innerHTML = fmt(data.ret_1m);
+      document.getElementById("m_ret_3m").innerHTML = fmt(data.ret_3m);
+      document.getElementById("m_ret_6m").innerHTML = fmt(data.ret_6m);
+      document.getElementById("m_ret_ybd").innerHTML = fmt(data.ret_ybd);
+      document.getElementById("m_ret_1y").innerHTML = fmt(data.ret_1y);
+      document.getElementById("m_ret_3y").innerHTML = fmt(data.ret_3y);
+      document.getElementById("m_ret_5y").innerHTML = fmt(data.ret_5y);
+      
+      document.getElementById('tefasModal').classList.remove('hidden');
+    }
+  }
+
+  function tefasModalKapat() {
+    document.getElementById('tefasModal').classList.add('hidden');
+  }
+
+  function tablolariCiz() {
+    islemler.sort((a, b) => new Date(b.tarih) - new Date(a.tarih));
+
+    const fonGruplari = {};
+    islemler.forEach(i => {
+      if (!fonGruplari[i.kod]) fonGruplari[i.kod] = [];
+      fonGruplari[i.kod].push(i);
+    });
+
+    const quotesContainer = document.getElementById("gecmisQuotes");
+    let quotesHtml = "";
+    const fonKodlari = Object.keys(fonGruplari);
+
+    if (fonKodlari.length === 0) {
+      quotesContainer.innerHTML = `<div class="text-slate-500 text-center py-4">Henüz kayıtlı işlem bulunmuyor.</div>`;
+    } else {
+      fonKodlari.forEach((kod) => {
+        const grupIslemler = fonGruplari[kod];
+        const collapseId = `quoteCollapse_${kod}`;
+        let tabloSatirlari = "";
+
+        grupIslemler.forEach(i => {
+          tabloSatirlari += `
+            <tr class="hover:bg-slate-800/40 border-b border-slate-800/40">
+              <td class="py-2 px-3 text-slate-300">${i.tarih}</td>
+              <td class="py-2 px-3"><span class="px-2 py-0.5 rounded-md text-xs font-bold ${i.tip === 'AL' ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20' : 'bg-rose-500/10 text-rose-400 border border-rose-500/20'}">${i.tip}</span></td>
+              <td class="py-2 px-3 text-slate-300">${i.adet}</td>
+              <td class="py-2 px-3 text-slate-300">${formatMoney(i.fiyat)} ₺</td>
+              <td class="py-2 px-3 text-slate-300">${formatMoney(i.adet * i.fiyat)} ₺</td>
+              <td class="py-2 px-3"><button onclick="islemSil(${i.id})" class="text-rose-400 hover:text-rose-300 text-xs hover:underline">Sil</button></td>
+            </tr>`;
+        });
+
+        quotesHtml += `
+          <div class="bg-dark-input border border-slate-800 rounded-xl overflow-hidden">
+            <button onclick="document.getElementById('${collapseId}').classList.toggle('hidden')" class="w-full px-4 py-3 flex justify-between items-center text-left hover:bg-slate-800/50 transition-all">
+              <div class="flex items-center gap-2">
+                <span class="px-2.5 py-1 rounded-lg bg-blue-500/10 text-blue-400 border border-blue-500/20 font-bold text-xs">${kod}</span>
+                <span class="text-sm font-semibold text-slate-200">İşlem Kayıtları (${grupIslemler.length})</span>
+              </div>
+              <span class="text-xs text-slate-400">Göster / Gizle</span>
+            </button>
+            <div id="${collapseId}" class="hidden p-3 border-t border-slate-800/60 bg-slate-900/40">
+              <div class="overflow-x-auto">
+                <table class="w-full text-left text-xs">
+                  <thead>
+                    <tr class="text-slate-400 border-b border-slate-800">
+                      <th class="pb-2 px-3">Tarih</th><th class="pb-2 px-3">Tip</th><th class="pb-2 px-3">Adet</th><th class="pb-2 px-3">Fiyat</th><th class="pb-2 px-3">Toplam</th><th class="pb-2 px-3">İşlem</th>
+                    </tr>
+                  </thead>
+                  <tbody>${tabloSatirlari}</tbody>
+                </table>
+              </div>
+            </div>
+          </div>`;
+      });
+      quotesContainer.innerHTML = quotesHtml;
+    }
+
     let portfoy = {};
-    dbIslemler.forEach(i => {
-      if (!portfoy[i.kod]) portfoy[i.kod] = { adet: 0, toplamMaliyet: 0 };
+    const kronolojikIslemler = [...islemler].sort((a, b) => new Date(a.tarih) - new Date(b.tarih));
+    const bugunMs = new Date().getTime();
+
+    kronolojikIslemler.forEach(i => {
+      if (!portfoy[i.kod]) {
+        portfoy[i.kod] = { adet: 0, toplamMaliyet: 0, zamanAgridikliGun: 0 };
+      }
+      
+      const islemTarihiMs = new Date(i.tarih).getTime();
+      const gecenGun = Math.max(0, Math.floor((bugunMs - islemTarihiMs) / (1000 * 60 * 60 * 24)));
+
       if (i.tip === 'AL') {
-        portfoy[i.kod].adet += i.adet;
+        const eskiAdet = portfoy[i.kod].adet;
+        const yeniAdet = eskiAdet + i.adet;
+        
+        portfoy[i.kod].zamanAgridikliGun = ((eskiAdet * portfoy[i.kod].zamanAgridikliGun) + (i.adet * gecenGun)) / (yeniAdet || 1);
+        portfoy[i.kod].adet = yeniAdet;
         portfoy[i.kod].toplamMaliyet += (i.adet * i.fiyat);
-      } else {
-        const ort = portfoy[i.kod].toplamMaliyet / (portfoy[i.kod].adet || 1);
+      } else if (i.tip === 'SAT') {
+        const ortMaliyet = portfoy[i.kod].toplamMaliyet / (portfoy[i.kod].adet || 1);
         portfoy[i.kod].adet -= i.adet;
-        portfoy[i.kod].toplamMaliyet -= (i.adet * ort);
+        portfoy[i.kod].toplamMaliyet -= (i.adet * ortMaliyet);
       }
     });
 
-    let html = "", genMaliyet = 0, genDeger = 0;
+    let portfoyHtml = "";
+    let genMaliyet = 0;
+    let genDeger = 0;
+
     Object.keys(portfoy).forEach(kod => {
       const pos = portfoy[kod];
       if (pos.adet > 0.00001) {
         const ortMaliyet = pos.toplamMaliyet / pos.adet;
-        const guncelFiyat = tefasFiyatlar[kod] ? tefasFiyatlar[kod].price : ortMaliyet;
+        const tefasData = tefasFiyatlar[kod] || { price: ortMaliyet };
+        
+        const guncelFiyat = tefasData.price;
         const guncelDeger = pos.adet * guncelFiyat;
+        
         const karTL = guncelDeger - pos.toplamMaliyet;
         const karYuzde = ortMaliyet > 0 ? ((guncelFiyat - ortMaliyet) / ortMaliyet) * 100 : 0;
 
-        genMaliyet += pos.toplamMaliyet; genDeger += guncelDeger;
-        html += `<tr class="hover:bg-slate-800/40">
-          <td class="py-3 font-bold text-blue-400">${kod}</td>
-          <td class="py-3">${pos.adet}</td>
-          <td class="py-3">${formatMoney(ortMaliyet)} ₺</td>
-          <td class="py-3">${formatMoney(guncelFiyat)} ₺</td>
-          <td class="py-3 font-bold">${formatMoney(guncelDeger)} ₺</td>
-          <td class="py-3 ${karTL >= 0 ? 'pos':'neg'}">${formatMoney(karTL)} ₺</td>
-          <td class="py-3 ${karYuzde >= 0 ? 'pos':'neg'}">%${karYuzde.toFixed(2)}</td>
-        </tr>`;
+        genMaliyet += pos.toplamMaliyet;
+        genDeger += guncelDeger;
+
+        const gunSayisi = Math.round(pos.zamanAgridikliGun);
+
+        portfoyHtml += `
+          <tr class="hover:bg-slate-800/40 transition-colors">
+            <td class="py-3 px-3">
+              <button onclick="tefasModalAc('${kod}')" class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-blue-500/10 hover:bg-blue-500/20 border border-blue-500/30 text-blue-400 font-bold text-xs transition-all">
+                🔍 ${kod}
+              </button>
+            </td>
+            <td class="py-3 px-3">${pos.adet}</td>
+            <td class="py-3 px-3">${formatMoney(ortMaliyet)} ₺</td>
+            <td class="py-3 px-3">${formatMoney(guncelFiyat)} ₺</td>
+            <td class="py-3 px-3 font-semibold text-white">${formatMoney(guncelDeger)} ₺</td>
+            <td class="py-3 px-3 ${karTL >= 0 ? 'pos' : 'neg'}">${karTL > 0 ? '+' : ''}${formatMoney(karTL)} ₺</td>
+            <td class="py-3 px-3 ${karYuzde >= 0 ? 'pos' : 'neg'}">%${karYuzde > 0 ? '+' : ''}${formatPercent(karYuzde)}</td>
+            <td class="py-3 px-3"><span class="px-2.5 py-1 rounded-md text-xs font-medium bg-slate-800 text-slate-300 border border-slate-700">${gunSayisi} Gün</span></td>
+          </tr>`;
       }
     });
 
-    document.getElementById("portfoyTablosu").innerHTML = html || `<tr><td colspan="7" class="text-center py-4 text-slate-500">Henüz bir işleminiz yok.</td></tr>`;
+    document.getElementById("portfoyTablosu").innerHTML = portfoyHtml || `<tr><td colspan="8" class="text-slate-500 text-center py-6">Portföyünüzde henüz aktif fon bulunmuyor.</td></tr>`;
+
+    const genKarTL = genDeger - genMaliyet;
+    const genKarYuzde = genMaliyet > 0 ? (genKarTL / genMaliyet) * 100 : 0;
+
     document.getElementById("toplamDeger").innerText = formatMoney(genDeger) + " ₺";
     document.getElementById("toplamMaliyet").innerText = formatMoney(genMaliyet) + " ₺";
-    const genKar = genDeger - genMaliyet;
-    document.getElementById("toplamKar").innerText = formatMoney(genKar) + " ₺";
-    document.getElementById("toplamKar").className = "text-2xl font-bold " + (genKar >= 0 ? "pos" : "neg");
-    
-    const genKarYuzde = genMaliyet > 0 ? (genKar / genMaliyet) * 100 : 0;
-    document.getElementById("toplamKarYuzde").innerText = "%" + genKarYuzde.toFixed(2);
-    document.getElementById("toplamKarYuzde").className = "text-2xl font-bold " + (genKarYuzde >= 0 ? "pos" : "neg");
+
+    const elKar = document.getElementById("toplamKar");
+    elKar.innerText = (genKarTL > 0 ? "+" : "") + formatMoney(genKarTL) + " ₺";
+    elKar.className = "text-2xl font-bold " + (genKarTL >= 0 ? "pos" : "neg");
+
+    const elKarYuzde = document.getElementById("toplamKarYuzde");
+    elKarYuzde.innerText = "%" + (genKarYuzde > 0 ? "+" : "") + formatPercent(genKarYuzde);
+    elKarYuzde.className = "text-2xl font-bold " + (genKarYuzde >= 0 ? "pos" : "neg");
   }
 
-  verileriYukle();
+  // Draggable Modal logic
+  const modalDialog = document.getElementById('tefasModal');
+  const modalHeader = document.getElementById('modalHeader');
+  let isDragging = false, offsetRight = 0, offsetBottom = 0;
+
+  modalHeader.addEventListener('mousedown', (e) => {
+    isDragging = true;
+    offsetRight = e.clientX - modalDialog.offsetLeft;
+    offsetBottom = e.clientY - modalDialog.offsetTop;
+  });
+
+  document.addEventListener('mousemove', (e) => {
+    if (isDragging) {
+      modalDialog.style.left = (e.clientX - offsetRight) + 'px';
+      modalDialog.style.top = (e.clientY - offsetBottom) + 'px';
+    }
+  });
+
+  document.addEventListener('mouseup', () => { isDragging = false; });
+
+  portfoyuGuncelle();
 </script>
-{% endif %}
 </body>
-</html>"""
-
-ADMIN_TEMPLATE = """<!DOCTYPE html>
-<html lang="tr" class="dark">
-<head>
-  <meta charset="UTF-8"><title>Admin Paneli</title>
-  <script src="https://cdn.tailwindcss.com"></script>
-  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;600;800&display=swap" rel="stylesheet">
-</head>
-<body class="bg-[#0b0f17] text-white font-['Plus_Jakarta_Sans'] p-8">
-  <div class="max-w-6xl mx-auto space-y-8">
-    <div class="flex justify-between items-center">
-      <h1 class="text-2xl font-extrabold">Admin Yönetim Paneli</h1>
-      <a href="/" class="px-4 py-2 bg-slate-800 hover:bg-slate-700 rounded-xl text-xs font-bold">Arayüze Dön</a>
-    </div>
-
-    {% with messages = get_flashed_messages() %}
-      {% if messages %}
-        {% for msg in messages %}<div class="bg-blue-500/10 border border-blue-500/30 text-blue-400 p-4 rounded-xl text-sm font-semibold">{{ msg }}</div>{% endfor %}
-      {% endif %}
-    {% endwith %}
-
-    <div class="grid grid-cols-1 md:grid-cols-2 gap-8">
-      <div class="bg-[#151c28] border border-slate-800 rounded-2xl p-6 shadow-xl">
-        <h2 class="text-lg font-bold mb-4">Profil Bilgilerini Güncelle</h2>
-        <form action="/admin/update_profile" method="POST" class="space-y-4">
-          <div>
-            <label class="block text-xs font-semibold text-slate-400 mb-1">Yeni Kullanıcı Adı</label>
-            <input type="text" name="new_username" value="{{ current_user.username }}" class="w-full bg-[#1a2332] border border-slate-700/60 rounded-xl px-4 py-2 text-sm text-white focus:outline-none focus:border-blue-500" required>
-          </div>
-          <div>
-            <label class="block text-xs font-semibold text-slate-400 mb-1">Yeni Şifre (Değişmeyecekse boş bırakın)</label>
-            <input type="password" name="new_password" placeholder="••••••••" class="w-full bg-[#1a2332] border border-slate-700/60 rounded-xl px-4 py-2 text-sm text-white focus:outline-none focus:border-blue-500">
-          </div>
-          <button type="submit" class="w-full py-2.5 bg-blue-600 hover:bg-blue-500 rounded-xl font-bold text-sm">Bilgileri Güncelle</button>
-        </form>
-      </div>
-
-      <div class="bg-[#151c28] border border-slate-800 rounded-2xl p-6 shadow-xl">
-        <h2 class="text-lg font-bold mb-4">Yeni Kullanıcı Ekle</h2>
-        <form action="/admin/add_user" method="POST" class="space-y-4">
-          <div>
-            <label class="block text-xs font-semibold text-slate-400 mb-1">Kullanıcı Adı</label>
-            <input type="text" name="username" class="w-full bg-[#1a2332] border border-slate-700/60 rounded-xl px-4 py-2 text-sm text-white focus:outline-none focus:border-blue-500" required>
-          </div>
-          <div>
-            <label class="block text-xs font-semibold text-slate-400 mb-1">Şifre</label>
-            <input type="password" name="password" class="w-full bg-[#1a2332] border border-slate-700/60 rounded-xl px-4 py-2 text-sm text-white focus:outline-none focus:border-blue-500" required>
-          </div>
-          <div class="flex items-center gap-2">
-            <input type="checkbox" id="is_admin" name="is_admin" class="rounded">
-            <label for="is_admin" class="text-xs text-slate-300">Admin Yetkisi Ver</label>
-          </div>
-          <button type="submit" class="w-full py-2.5 bg-purple-600 hover:bg-purple-500 rounded-xl font-bold text-sm">Kullanıcı Oluştur</button>
-        </form>
-      </div>
-    </div>
-    
-    <div class="bg-[#151c28] border border-slate-800 rounded-2xl p-6 shadow-xl">
-      <h2 class="text-lg font-bold mb-4">Kayıtlı Kullanıcılar ({{ users|length }})</h2>
-      <table class="w-full text-left text-sm">
-        <thead>
-          <tr class="border-b border-slate-700 text-xs text-slate-400 uppercase">
-            <th class="pb-3">ID</th><th class="pb-3">Kullanıcı Adı</th><th class="pb-3">Rol</th><th class="pb-3">Kayıt Tarihi</th><th class="pb-3">İşlem</th>
-          </tr>
-        </thead>
-        <tbody class="divide-y divide-slate-800">
-          {% for u in users %}
-          <tr>
-            <td class="py-3 text-slate-400">#{{ u.id }}</td>
-            <td class="py-3 font-bold">{{ u.username }}</td>
-            <td class="py-3">{% if u.is_admin %}<span class="px-2 py-1 bg-purple-500/20 text-purple-400 rounded text-xs font-bold">Admin</span>{% else %}<span class="px-2 py-1 bg-slate-800 text-slate-400 rounded text-xs">Üye</span>{% endif %}</td>
-            <td class="py-3 text-slate-400">{{ u.created_at.strftime('%Y-%m-%d %H:%M') }}</td>
-            <td class="py-3">
-              {% if u.id != current_user.id %}
-              <a href="/admin/delete_user/{{ u.id }}" onclick="return confirm('Bu kullanıcı silinsin mi?')" class="text-rose-400 hover:underline text-xs">Sil</a>
-              {% else %}
-              <span class="text-xs text-slate-600">Aktif Oturum</span>
-              {% endif %}
-            </td>
-          </tr>
-          {% endfor %}
-        </tbody>
-      </table>
-    </div>
-  </div>
-</body>
-</html>"""
-
-# ==================== ROUTE'LAR ====================
+</html>
+"""
 
 @app.route('/')
 def home():
-    return render_template_string(MAIN_TEMPLATE)
-
-@app.route('/login', methods=['GET', 'POST'])
-def login():
-    if request.method == 'POST':
-        user = User.query.filter_by(username=request.form.get('username')).first()
-        if user and user.check_password(request.form.get('password')):
-            login_user(user)
-            return redirect(url_for('home'))
-        flash('Hatalı kullanıcı adı veya parola!')
-    return render_template_string(AUTH_TEMPLATE, title="Giriş Yap", button_text="Giriş Yap", is_login=True)
-
-@app.route('/register', methods=['GET', 'POST'])
-def register():
-    if request.method == 'POST':
-        username = request.form.get('username')
-        if User.query.filter_by(username=username).first():
-            flash('Bu kullanıcı adı zaten alınmış.')
-        else:
-            user = User(username=username)
-            user.set_password(request.form.get('password'))
-            db.session.add(user)
-            db.session.commit()
-            login_user(user)
-            return redirect(url_for('home'))
-    return render_template_string(AUTH_TEMPLATE, title="Hesap Oluştur", button_text="Kayıt Ol", is_login=False)
-
-@app.route('/logout')
-@login_required
-def logout():
-    logout_user()
-    return redirect(url_for('home'))
-
-@app.route('/admin')
-@login_required
-def admin_panel():
-    if not current_user.is_admin:
-        return "Erişim Yetkiniz Yok!", 403
-    users = User.query.all()
-    return render_template_string(ADMIN_TEMPLATE, users=users)
-
-@app.route('/admin/update_profile', methods=['POST'])
-@login_required
-def update_profile():
-    if not current_user.is_admin:
-        return "Yetkisiz İşlem", 403
-    
-    new_username = request.form.get('new_username')
-    new_password = request.form.get('new_password')
-    
-    if new_username:
-        existing = User.query.filter_by(username=new_username).first()
-        if existing and existing.id != current_user.id:
-            flash('Bu kullanıcı adı başka biri tarafından kullanılıyor.')
-            return redirect(url_for('admin_panel'))
-        current_user.username = new_username
-        
-    if new_password:
-        current_user.set_password(new_password)
-        
-    db.session.commit()
-    flash('Profil bilgileriniz başarıyla güncellendi!')
-    return redirect(url_for('admin_panel'))
-
-@app.route('/admin/add_user', methods=['POST'])
-@login_required
-def admin_add_user():
-    if not current_user.is_admin:
-        return "Yetkisiz İşlem", 403
-    
-    username = request.form.get('username')
-    password = request.form.get('password')
-    is_admin = True if request.form.get('is_admin') == 'on' else False
-    
-    if User.query.filter_by(username=username).first():
-        flash('Bu kullanıcı adı zaten mevcut.')
-    else:
-        new_user = User(username=username, is_admin=is_admin)
-        new_user.set_password(password)
-        db.session.add(new_user)
-        db.session.commit()
-        flash('Yeni kullanıcı başarıyla eklendi.')
-        
-    return redirect(url_for('admin_panel'))
-
-@app.route('/admin/delete_user/<int:user_id>')
-@login_required
-def delete_user(user_id):
-    if not current_user.is_admin:
-        return "Yetkisiz İşlem", 403
-    user = User.query.get_or_404(user_id)
-    if user.id != current_user.id:
-        db.session.delete(user)
-        db.session.commit()
-        flash('Kullanıcı silindi.')
-    return redirect(url_for('admin_panel'))
-
-# ==================== API ENDPOINT'LERİ ====================
-
-@app.route('/api/user_transactions')
-@login_required
-def get_user_transactions():
-    txs = Transaction.query.filter_by(user_id=current_user.id).all()
-    return jsonify([{"id": t.id, "tarih": t.tarih, "kod": t.kod, "tip": t.tip, "adet": t.adet, "fiyat": t.fiyat} for t in txs])
-
-@app.route('/api/add_transaction', methods=['POST'])
-@login_required
-def add_transaction():
-    data = request.json
-    tx = Transaction(
-        user_id=current_user.id,
-        tarih=data['tarih'],
-        kod=data['kod'].upper(),
-        tip=data['tip'],
-        adet=float(data['adet']),
-        fiyat=float(data['fiyat'])
-    )
-    db.session.add(tx)
-    db.session.commit()
-    return jsonify({"status": "success"})
+    return render_template_string(HTML_TEMPLATE)
 
 @app.route('/api/fon')
 def api_fon():
     kod = request.args.get('kod', '').strip()
     result = get_tefas_data_crawler(kod)
-    return jsonify({"status": "success", "data": result}) if result else (jsonify({"status": "error"}), 404)
+    if result:
+        return jsonify({"status": "success", "data": result})
+    return jsonify({"status": "error", "message": "Fon verisi alınamadı"}), 404
 
 @app.route('/api/fon_tarihli_fiyat')
 def api_fon_tarihli_fiyat():
     kod = request.args.get('kod', '').strip()
     tarih = request.args.get('tarih', '').strip()
     result = get_tefas_price_on_date(kod, tarih)
-    return jsonify({"status": "success", "data": result}) if result else (jsonify({"status": "error"}), 404)
+    if result:
+        return jsonify({"status": "success", "data": result})
+    return jsonify({"status": "error", "message": "Tarihli fiyat verisi alınamadı"}), 404
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, debug=True)
