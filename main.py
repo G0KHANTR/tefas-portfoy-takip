@@ -54,19 +54,22 @@ with app.app_context():
         db.session.add(admin)
         db.session.commit()
 
-# ==================== TEFAS VERİ ÇEKME MOTORU ====================
+# ==================== TEFAS VERİ ÇEKME MOTORU (GÜNCELLENDİ) ====================
 
 def fetch_tefas_raw(fon_kodu, start_date, end_date):
     url = "https://www.tefas.gov.tr/api/DB/BindHistoryInfo"
     
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         "Accept": "application/json, text/javascript, */*; q=0.01",
         "Accept-Language": "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7",
         "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
         "X-Requested-With": "XMLHttpRequest",
         "Origin": "https://www.tefas.gov.tr",
         "Referer": "https://www.tefas.gov.tr/TarihselVeriler.aspx",
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-origin",
         "Connection": "keep-alive"
     }
     
@@ -82,7 +85,9 @@ def fetch_tefas_raw(fon_kodu, start_date, end_date):
     
     try:
         session = requests.Session()
-        session.get("https://www.tefas.gov.tr/TarihselVeriler.aspx", headers=headers, timeout=8)
+        # TEFAS Güvenlik Duvarı için Oturum Başlatma ve Çerez Alımı
+        session.get("https://www.tefas.gov.tr/TarihselVeriler.aspx", headers=headers, timeout=10)
+        
         r = session.post(url, headers=headers, data=payload, timeout=10)
         if r.status_code == 200:
             res = r.json()
@@ -266,15 +271,22 @@ MAIN_TEMPLATE = """<!DOCTYPE html>
     if (!fiyat || isNaN(fiyat)) {
       btn.innerText = "Fiyat Alınıyor...";
       btn.disabled = true;
-      const res = await fetch(`/api/fon_tarihli_fiyat?kod=${kod}&tarih=${tarih}`);
-      const data = await res.json();
-      if (data.status === 'success') {
-        fiyat = data.data.price;
-      } else { 
-        alert("Fiyat TEFAS sisteminden alınamadı. Lütfen birim fiyatı manuel olarak girin."); 
+      try {
+        const res = await fetch(`/api/fon_tarihli_fiyat?kod=${kod}&tarih=${tarih}`);
+        const data = await res.json();
+        if (data.status === 'success') {
+          fiyat = data.data.price;
+        } else { 
+          alert("Fiyat TEFAS sisteminden alınamadı. Lütfen birim fiyatı manuel olarak girin."); 
+          btn.innerText = "Kaydet"; 
+          btn.disabled = false; 
+          return; 
+        }
+      } catch (err) {
+        alert("Bağlantı hatası oluştu. Lütfen elle fiyat girin.");
         btn.innerText = "Kaydet"; 
-        btn.disabled = false; 
-        return; 
+        btn.disabled = false;
+        return;
       }
     }
 
@@ -293,9 +305,11 @@ MAIN_TEMPLATE = """<!DOCTYPE html>
   async function portfoyuGuncelle() {
     const fonKodlari = [...new Set(dbIslemler.map(x => x.kod))];
     for (const kod of fonKodlari) {
-      const res = await fetch(`/api/fon?kod=${kod}`);
-      const data = await res.json();
-      if (data.status === 'success') tefasFiyatlar[kod] = data.data;
+      try {
+        const res = await fetch(`/api/fon?kod=${kod}`);
+        const data = await res.json();
+        if (data.status === 'success') tefasFiyatlar[kod] = data.data;
+      } catch (e) {}
     }
     tabloCiz();
   }
@@ -343,6 +357,10 @@ MAIN_TEMPLATE = """<!DOCTYPE html>
     const genKar = genDeger - genMaliyet;
     document.getElementById("toplamKar").innerText = formatMoney(genKar) + " ₺";
     document.getElementById("toplamKar").className = "text-2xl font-bold " + (genKar >= 0 ? "pos" : "neg");
+    
+    const genKarYuzde = genMaliyet > 0 ? (genKar / genMaliyet) * 100 : 0;
+    document.getElementById("toplamKarYuzde").innerText = "%" + genKarYuzde.toFixed(2);
+    document.getElementById("toplamKarYuzde").className = "text-2xl font-bold " + (genKarYuzde >= 0 ? "pos" : "neg");
   }
 
   verileriYukle();
