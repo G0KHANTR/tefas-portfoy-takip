@@ -9,7 +9,7 @@ import requests
 import os
 
 app = Flask(__name__)
-app.config['SECRET_KEY'] = 'gizli-anahtar-buraya-geleccek-12345'
+app.config['SECRET_KEY'] = 'gizli-anahtar-buraya-gelecek-12345'
 app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///tefas_portfoy.db'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
@@ -55,15 +55,20 @@ with app.app_context():
         db.session.add(admin)
         db.session.commit()
 
-# ==================== TEFAS YARDIMCI FONKSİYONLARI (API DIRECT) ====================
+# ==================== TEFAS YARDIMCI FONKSİYONLARI ====================
 
 def fetch_tefas_raw(fon_kodu, start_date, end_date):
     url = "https://www.tefas.gov.tr/api/DB/BindHistoryInfo"
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "X-Requested-With": "XMLHttpRequest"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "Accept-Language": "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+        "X-Requested-With": "XMLHttpRequest",
+        "Origin": "https://www.tefas.gov.tr",
+        "Referer": "https://www.tefas.gov.tr/TarihselVeriler.aspx"
     }
-    # TEFAS API formatı: MM/DD/YYYY
+    
     start_dt = datetime.strptime(start_date, "%Y-%m-%d").strftime("%m/%d/%Y")
     end_dt = datetime.strptime(end_date, "%Y-%m-%d").strftime("%m/%d/%Y")
     
@@ -73,12 +78,16 @@ def fetch_tefas_raw(fon_kodu, start_date, end_date):
         "endDate": end_dt,
         "fontKod": fon_kodu.upper()
     }
+    
     try:
-        r = requests.post(url, headers=headers, data=payload, timeout=10)
+        session = requests.Session()
+        session.get("https://www.tefas.gov.tr/TarihselVeriler.aspx", headers=headers, timeout=5)
+        r = session.post(url, headers=headers, data=payload, timeout=10)
         if r.status_code == 200:
-            return r.json().get('data', [])
+            res = r.json()
+            return res.get('data', [])
     except Exception as e:
-        print(f"API Hata: {e}")
+        print(f"TEFAS Istek Hatasi: {e}")
     return []
 
 def get_tefas_price_on_date(fon_kodu, hedef_tarih_str):
@@ -86,7 +95,6 @@ def get_tefas_price_on_date(fon_kodu, hedef_tarih_str):
     baslangic = (hedef_tarih - timedelta(days=10)).strftime("%Y-%m-%d")
     data = fetch_tefas_raw(fon_kodu, baslangic, hedef_tarih_str)
     if data:
-        # En güncel tarihi al
         last_item = data[-1]
         raw_date = datetime.fromtimestamp(int(last_item['TARIH']) / 1000).strftime("%Y-%m-%d")
         return {"price": float(last_item['FIYAT']), "date": raw_date}
@@ -94,7 +102,7 @@ def get_tefas_price_on_date(fon_kodu, hedef_tarih_str):
 
 def get_tefas_data_crawler(fon_kodu):
     bugun = datetime.now()
-    baslangic = (bugun - timedelta(days=30)).strftime("%Y-%m-%d")
+    baslangic = (bugun - timedelta(days=15)).strftime("%Y-%m-%d")
     data = fetch_tefas_raw(fon_kodu, baslangic, bugun.strftime("%Y-%m-%d"))
     if data:
         last_item = data[-1]
@@ -120,7 +128,10 @@ AUTH_TEMPLATE = """<!DOCTYPE html>
 </head>
 <body class="bg-[#0b0f17] text-white font-['Plus_Jakarta_Sans'] min-h-screen flex items-center justify-center p-4">
   <div class="max-w-md w-full bg-[#151c28] border border-slate-800 rounded-2xl p-8 shadow-2xl">
-    <h2 class="text-2xl font-extrabold text-center mb-6">{{ title }}</h2>
+    <div class="flex justify-between items-center mb-6">
+      <h2 class="text-2xl font-extrabold">{{ title }}</h2>
+      <a href="/" class="text-xs text-slate-400 hover:text-white">← Ana Sayfa</a>
+    </div>
     {% with messages = get_flashed_messages() %}
       {% if messages %}
         {% for msg in messages %}<div class="bg-rose-500/10 border border-rose-500/20 text-rose-400 p-3 rounded-xl mb-4 text-xs">{{ msg }}</div>{% endfor %}
@@ -164,17 +175,38 @@ MAIN_TEMPLATE = """<!DOCTYPE html>
       <div class="w-10 h-10 rounded-xl bg-blue-600 flex items-center justify-center font-extrabold text-xl">T</div>
       <div>
         <h1 class="text-2xl font-extrabold">TEFAS <span class="text-blue-400">Portföy Takip</span></h1>
+        {% if current_user.is_authenticated %}
         <p class="text-xs text-slate-400">Hoş geldin, <span class="text-white font-bold">{{ current_user.username }}</span></p>
+        {% else %}
+        <p class="text-xs text-slate-400">Yatırım Fonları Takip Platformu</p>
+        {% endif %}
       </div>
     </div>
     <div class="flex items-center gap-3">
-      {% if current_user.is_admin %}
-      <a href="/admin" class="px-4 py-2 bg-purple-600/20 hover:bg-purple-600/30 border border-purple-500/30 text-purple-400 rounded-xl text-xs font-bold transition-all">Admin Paneli</a>
+      {% if current_user.is_authenticated %}
+        {% if current_user.is_admin %}
+        <a href="/admin" class="px-4 py-2 bg-purple-600/20 hover:bg-purple-600/30 border border-purple-500/30 text-purple-400 rounded-xl text-xs font-bold transition-all">Admin Paneli</a>
+        {% endif %}
+        <a href="/logout" class="px-4 py-2 bg-rose-500/10 hover:bg-rose-500/20 border border-rose-500/30 text-rose-400 rounded-xl text-xs font-bold transition-all">Çıkış Yap</a>
+      {% else %}
+        <a href="/login" class="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-white rounded-xl text-xs font-bold transition-all">Giriş Yap</a>
+        <a href="/register" class="px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white rounded-xl text-xs font-bold transition-all">Kayıt Ol</a>
       {% endif %}
-      <a href="/logout" class="px-4 py-2 bg-rose-500/10 hover:bg-rose-500/20 border border-rose-500/30 text-rose-400 rounded-xl text-xs font-bold transition-all">Çıkış Yap</a>
     </div>
   </header>
 
+  {% if not current_user.is_authenticated %}
+  <div class="glass-card rounded-2xl p-8 mb-8 text-center border border-blue-500/30">
+    <h2 class="text-2xl font-extrabold mb-2">Portföyünüzü Takip Etmeye Başlayın</h2>
+    <p class="text-sm text-slate-400 mb-6 max-w-xl mx-auto">İşlem yapmak, canlı TEFAS fiyatları üzerinden kâr/zarar hesabı tutmak ve alım-satım kayıtlarınızı yönetmek için giriş yapın veya ücretsiz hesap oluşturun.</p>
+    <div class="flex justify-center gap-4">
+      <a href="/login" class="px-6 py-3 bg-blue-600 hover:bg-blue-500 rounded-xl font-bold text-sm">Giriş Yap</a>
+      <a href="/register" class="px-6 py-3 bg-slate-800 hover:bg-slate-700 rounded-xl font-bold text-sm">Ücretsiz Kayıt Ol</a>
+    </div>
+  </div>
+  {% else %}
+
+  <!-- Özet Kartları -->
   <div class="grid grid-cols-1 sm:grid-cols-4 gap-4 mb-8">
     <div class="glass-card rounded-2xl p-5"><span class="text-xs font-semibold text-slate-400 uppercase">Toplam Değer</span><h3 class="text-2xl font-bold" id="toplamDeger">0.00 ₺</h3></div>
     <div class="glass-card rounded-2xl p-5"><span class="text-xs font-semibold text-slate-400 uppercase">Anapara</span><h3 class="text-2xl font-bold" id="toplamMaliyet">0.00 ₺</h3></div>
@@ -182,6 +214,7 @@ MAIN_TEMPLATE = """<!DOCTYPE html>
     <div class="glass-card rounded-2xl p-5"><span class="text-xs font-semibold text-slate-400 uppercase">Kâr Oranı</span><h3 class="text-2xl font-bold" id="toplamKarYuzde">%0.00</h3></div>
   </div>
 
+  <!-- İşlem Formu -->
   <div class="glass-card rounded-2xl p-6 mb-8">
     <h2 class="text-lg font-bold mb-4">Yeni İşlem Ekle</h2>
     <form id="islemForm" onsubmit="islemEkle(event)" class="grid grid-cols-1 sm:grid-cols-12 gap-4">
@@ -194,6 +227,7 @@ MAIN_TEMPLATE = """<!DOCTYPE html>
     </form>
   </div>
 
+  <!-- Portföy Tablosu -->
   <div class="glass-card rounded-2xl p-6 mb-8 overflow-x-auto">
     <h2 class="text-lg font-bold mb-4">Fon Varlıkları</h2>
     <table class="w-full text-left text-sm">
@@ -205,8 +239,10 @@ MAIN_TEMPLATE = """<!DOCTYPE html>
       <tbody id="portfoyTablosu" class="divide-y divide-slate-800"></tbody>
     </table>
   </div>
+  {% endif %}
 </div>
 
+{% if current_user.is_authenticated %}
 <script>
   let dbIslemler = [];
   let tefasFiyatlar = {};
@@ -234,8 +270,14 @@ MAIN_TEMPLATE = """<!DOCTYPE html>
       btn.disabled = true;
       const res = await fetch(`/api/fon_tarihli_fiyat?kod=${kod}&tarih=${tarih}`);
       const data = await res.json();
-      if (data.status === 'success') fiyat = data.data.price;
-      else { alert("Fiyat bulunamadı."); btn.innerText = "Kaydet"; btn.disabled = false; return; }
+      if (data.status === 'success') {
+        fiyat = data.data.price;
+      } else { 
+        alert("Fiyat TEFAS sisteminden alınamadı. Lütfen elle fiyat giriniz."); 
+        btn.innerText = "Kaydet"; 
+        btn.disabled = false; 
+        return; 
+      }
     }
 
     await fetch('/api/add_transaction', {
@@ -297,7 +339,7 @@ MAIN_TEMPLATE = """<!DOCTYPE html>
       }
     });
 
-    document.getElementById("portfoyTablosu").innerHTML = html || `<tr><td colspan="7" class="text-center py-4 text-slate-500">İşlem kaydı yok.</td></tr>`;
+    document.getElementById("portfoyTablosu").innerHTML = html || `<tr><td colspan="7" class="text-center py-4 text-slate-500">Henüz bir işleminiz yok.</td></tr>`;
     document.getElementById("toplamDeger").innerText = formatMoney(genDeger) + " ₺";
     document.getElementById("toplamMaliyet").innerText = formatMoney(genMaliyet) + " ₺";
     const genKar = genDeger - genMaliyet;
@@ -307,6 +349,7 @@ MAIN_TEMPLATE = """<!DOCTYPE html>
 
   verileriYukle();
 </script>
+{% endif %}
 </body>
 </html>"""
 
@@ -318,11 +361,57 @@ ADMIN_TEMPLATE = """<!DOCTYPE html>
   <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;600;800&display=swap" rel="stylesheet">
 </head>
 <body class="bg-[#0b0f17] text-white font-['Plus_Jakarta_Sans'] p-8">
-  <div class="max-w-6xl mx-auto">
-    <div class="flex justify-between items-center mb-8">
+  <div class="max-w-6xl mx-auto space-y-8">
+    <div class="flex justify-between items-center">
       <h1 class="text-2xl font-extrabold">Admin Yönetim Paneli</h1>
       <a href="/" class="px-4 py-2 bg-slate-800 hover:bg-slate-700 rounded-xl text-xs font-bold">Arayüze Dön</a>
     </div>
+
+    {% with messages = get_flashed_messages() %}
+      {% if messages %}
+        {% for msg in messages %}<div class="bg-blue-500/10 border border-blue-500/30 text-blue-400 p-4 rounded-xl text-sm font-semibold">{{ msg }}</div>{% endfor %}
+      {% endif %}
+    {% endwith %}
+
+    <div class="grid grid-cols-1 md:grid-cols-2 gap-8">
+      <!-- Admin Bilgilerini Güncelle -->
+      <div class="bg-[#151c28] border border-slate-800 rounded-2xl p-6 shadow-xl">
+        <h2 class="text-lg font-bold mb-4">Profil Bilgilerini Güncelle</h2>
+        <form action="/admin/update_profile" method="POST" class="space-y-4">
+          <div>
+            <label class="block text-xs font-semibold text-slate-400 mb-1">Yeni Kullanıcı Adı</label>
+            <input type="text" name="new_username" value="{{ current_user.username }}" class="w-full bg-[#1a2332] border border-slate-700/60 rounded-xl px-4 py-2 text-sm text-white focus:outline-none focus:border-blue-500" required>
+          </div>
+          <div>
+            <label class="block text-xs font-semibold text-slate-400 mb-1">Yeni Şifre (Boş bırakırsanız değişmez)</label>
+            <input type="password" name="new_password" placeholder="••••••••" class="w-full bg-[#1a2332] border border-slate-700/60 rounded-xl px-4 py-2 text-sm text-white focus:outline-none focus:border-blue-500">
+          </div>
+          <button type="submit" class="w-full py-2.5 bg-blue-600 hover:bg-blue-500 rounded-xl font-bold text-sm">Bilgileri Güncelle</button>
+        </form>
+      </div>
+
+      <!-- Yeni Kullanıcı Ekle -->
+      <div class="bg-[#151c28] border border-slate-800 rounded-2xl p-6 shadow-xl">
+        <h2 class="text-lg font-bold mb-4">Yeni Kullanıcı Ekle</h2>
+        <form action="/admin/add_user" method="POST" class="space-y-4">
+          <div>
+            <label class="block text-xs font-semibold text-slate-400 mb-1">Kullanıcı Adı</label>
+            <input type="text" name="username" class="w-full bg-[#1a2332] border border-slate-700/60 rounded-xl px-4 py-2 text-sm text-white focus:outline-none focus:border-blue-500" required>
+          </div>
+          <div>
+            <label class="block text-xs font-semibold text-slate-400 mb-1">Şifre</label>
+            <input type="password" name="password" class="w-full bg-[#1a2332] border border-slate-700/60 rounded-xl px-4 py-2 text-sm text-white focus:outline-none focus:border-blue-500" required>
+          </div>
+          <div class="flex items-center gap-2">
+            <input type="checkbox" id="is_admin" name="is_admin" class="rounded">
+            <label for="is_admin" class="text-xs text-slate-300">Admin Yetkisi Ver</label>
+          </div>
+          <button type="submit" class="w-full py-2.5 bg-purple-600 hover:bg-purple-500 rounded-xl font-bold text-sm">Kullanıcı Oluştur</button>
+        </form>
+      </div>
+    </div>
+    
+    <!-- Kullanıcı Listesi -->
     <div class="bg-[#151c28] border border-slate-800 rounded-2xl p-6 shadow-xl">
       <h2 class="text-lg font-bold mb-4">Kayıtlı Kullanıcılar ({{ users|length }})</h2>
       <table class="w-full text-left text-sm">
@@ -336,11 +425,13 @@ ADMIN_TEMPLATE = """<!DOCTYPE html>
           <tr>
             <td class="py-3 text-slate-400">#{{ u.id }}</td>
             <td class="py-3 font-bold">{{ u.username }}</td>
-            <td class="py-3">{% if u.is_admin %}<span class="px-2 py-1 bg-purple-500/20 text-purple-400 rounded text-xs">Admin</span>{% else %}<span class="px-2 py-1 bg-slate-800 text-slate-400 rounded text-xs">Üye</span>{% endif %}</td>
+            <td class="py-3">{% if u.is_admin %}<span class="px-2 py-1 bg-purple-500/20 text-purple-400 rounded text-xs font-bold">Admin</span>{% else %}<span class="px-2 py-1 bg-slate-800 text-slate-400 rounded text-xs">Üye</span>{% endif %}</td>
             <td class="py-3 text-slate-400">{{ u.created_at.strftime('%Y-%m-%d %H:%M') }}</td>
             <td class="py-3">
               {% if u.id != current_user.id %}
-              <a href="/admin/delete_user/{{ u.id }}" onclick="return confirm('Silinsin mi?')" class="text-rose-400 hover:underline text-xs">Kullanıcıyı Sil</a>
+              <a href="/admin/delete_user/{{ u.id }}" onclick="return confirm('Bu kullanıcı silinsin mi?')" class="text-rose-400 hover:underline text-xs">Sil</a>
+              {% else %}
+              <span class="text-xs text-slate-600">Aktif Oturum</span>
               {% endif %}
             </td>
           </tr>
@@ -355,7 +446,6 @@ ADMIN_TEMPLATE = """<!DOCTYPE html>
 # ==================== ROUTE 'LAR ====================
 
 @app.route('/')
-@login_required
 def home():
     return render_template_string(MAIN_TEMPLATE)
 
@@ -388,7 +478,9 @@ def register():
 @login_required
 def logout():
     logout_user()
-    return redirect(url_for('login'))
+    return redirect(url_for('home'))
+
+# ==================== ADMIN ROUTE 'LARI ====================
 
 @app.route('/admin')
 @login_required
@@ -397,6 +489,50 @@ def admin_panel():
         return "Erişim Yetkiniz Yok!", 403
     users = User.query.all()
     return render_template_string(ADMIN_TEMPLATE, users=users)
+
+@app.route('/admin/update_profile', methods=['POST'])
+@login_required
+def update_profile():
+    if not current_user.is_admin:
+        return "Yetkisiz İşlem", 403
+    
+    new_username = request.form.get('new_username')
+    new_password = request.form.get('new_password')
+    
+    if new_username:
+        existing = User.query.filter_by(username=new_username).first()
+        if existing and existing.id != current_user.id:
+            flash('Bu kullanıcı adı başka biri tarafından kullanılıyor.')
+            return redirect(url_for('admin_panel'))
+        current_user.username = new_username
+        
+    if new_password:
+        current_user.set_password(new_password)
+        
+    db.session.commit()
+    flash('Profil bilgileriniz güncellendi!')
+    return redirect(url_for('admin_panel'))
+
+@app.route('/admin/add_user', methods=['POST'])
+@login_required
+def admin_add_user():
+    if not current_user.is_admin:
+        return "Yetkisiz İşlem", 403
+    
+    username = request.form.get('username')
+    password = request.form.get('password')
+    is_admin = True if request.form.get('is_admin') == 'on' else False
+    
+    if User.query.filter_by(username=username).first():
+        flash('Bu kullanıcı adı zaten mevcut.')
+    else:
+        new_user = User(username=username, is_admin=is_admin)
+        new_user.set_password(password)
+        db.session.add(new_user)
+        db.session.commit()
+        flash('Yeni kullanıcı başarıyla eklendi.')
+        
+    return redirect(url_for('admin_panel'))
 
 @app.route('/admin/delete_user/<int:user_id>')
 @login_required
@@ -407,6 +543,7 @@ def delete_user(user_id):
     if user.id != current_user.id:
         db.session.delete(user)
         db.session.commit()
+        flash('Kullanıcı silindi.')
     return redirect(url_for('admin_panel'))
 
 # ==================== API ENDPOINT'LERİ ====================
