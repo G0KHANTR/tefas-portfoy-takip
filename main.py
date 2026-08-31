@@ -4,7 +4,6 @@ from flask_login import LoginManager, UserMixin, login_user, login_required, log
 from werkzeug.security import generate_password_hash, check_password_hash
 from flask_cors import CORS
 from datetime import datetime, timedelta
-import calendar
 import requests
 import os
 
@@ -55,18 +54,20 @@ with app.app_context():
         db.session.add(admin)
         db.session.commit()
 
-# ==================== TEFAS YARDIMCI FONKSİYONLARI ====================
+# ==================== TEFAS VERİ ÇEKME MOTORU ====================
 
 def fetch_tefas_raw(fon_kodu, start_date, end_date):
     url = "https://www.tefas.gov.tr/api/DB/BindHistoryInfo"
+    
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
         "Accept": "application/json, text/javascript, */*; q=0.01",
         "Accept-Language": "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7",
         "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
         "X-Requested-With": "XMLHttpRequest",
         "Origin": "https://www.tefas.gov.tr",
-        "Referer": "https://www.tefas.gov.tr/TarihselVeriler.aspx"
+        "Referer": "https://www.tefas.gov.tr/TarihselVeriler.aspx",
+        "Connection": "keep-alive"
     }
     
     start_dt = datetime.strptime(start_date, "%Y-%m-%d").strftime("%m/%d/%Y")
@@ -81,7 +82,7 @@ def fetch_tefas_raw(fon_kodu, start_date, end_date):
     
     try:
         session = requests.Session()
-        session.get("https://www.tefas.gov.tr/TarihselVeriler.aspx", headers=headers, timeout=5)
+        session.get("https://www.tefas.gov.tr/TarihselVeriler.aspx", headers=headers, timeout=8)
         r = session.post(url, headers=headers, data=payload, timeout=10)
         if r.status_code == 200:
             res = r.json()
@@ -92,7 +93,7 @@ def fetch_tefas_raw(fon_kodu, start_date, end_date):
 
 def get_tefas_price_on_date(fon_kodu, hedef_tarih_str):
     hedef_tarih = datetime.strptime(hedef_tarih_str, "%Y-%m-%d")
-    baslangic = (hedef_tarih - timedelta(days=10)).strftime("%Y-%m-%d")
+    baslangic = (hedef_tarih - timedelta(days=15)).strftime("%Y-%m-%d")
     data = fetch_tefas_raw(fon_kodu, baslangic, hedef_tarih_str)
     if data:
         last_item = data[-1]
@@ -206,7 +207,6 @@ MAIN_TEMPLATE = """<!DOCTYPE html>
   </div>
   {% else %}
 
-  <!-- Özet Kartları -->
   <div class="grid grid-cols-1 sm:grid-cols-4 gap-4 mb-8">
     <div class="glass-card rounded-2xl p-5"><span class="text-xs font-semibold text-slate-400 uppercase">Toplam Değer</span><h3 class="text-2xl font-bold" id="toplamDeger">0.00 ₺</h3></div>
     <div class="glass-card rounded-2xl p-5"><span class="text-xs font-semibold text-slate-400 uppercase">Anapara</span><h3 class="text-2xl font-bold" id="toplamMaliyet">0.00 ₺</h3></div>
@@ -214,7 +214,6 @@ MAIN_TEMPLATE = """<!DOCTYPE html>
     <div class="glass-card rounded-2xl p-5"><span class="text-xs font-semibold text-slate-400 uppercase">Kâr Oranı</span><h3 class="text-2xl font-bold" id="toplamKarYuzde">%0.00</h3></div>
   </div>
 
-  <!-- İşlem Formu -->
   <div class="glass-card rounded-2xl p-6 mb-8">
     <h2 class="text-lg font-bold mb-4">Yeni İşlem Ekle</h2>
     <form id="islemForm" onsubmit="islemEkle(event)" class="grid grid-cols-1 sm:grid-cols-12 gap-4">
@@ -227,7 +226,6 @@ MAIN_TEMPLATE = """<!DOCTYPE html>
     </form>
   </div>
 
-  <!-- Portföy Tablosu -->
   <div class="glass-card rounded-2xl p-6 mb-8 overflow-x-auto">
     <h2 class="text-lg font-bold mb-4">Fon Varlıkları</h2>
     <table class="w-full text-left text-sm">
@@ -273,7 +271,7 @@ MAIN_TEMPLATE = """<!DOCTYPE html>
       if (data.status === 'success') {
         fiyat = data.data.price;
       } else { 
-        alert("Fiyat TEFAS sisteminden alınamadı. Lütfen elle fiyat giriniz."); 
+        alert("Fiyat TEFAS sisteminden alınamadı. Lütfen birim fiyatı manuel olarak girin."); 
         btn.innerText = "Kaydet"; 
         btn.disabled = false; 
         return; 
@@ -374,7 +372,6 @@ ADMIN_TEMPLATE = """<!DOCTYPE html>
     {% endwith %}
 
     <div class="grid grid-cols-1 md:grid-cols-2 gap-8">
-      <!-- Admin Bilgilerini Güncelle -->
       <div class="bg-[#151c28] border border-slate-800 rounded-2xl p-6 shadow-xl">
         <h2 class="text-lg font-bold mb-4">Profil Bilgilerini Güncelle</h2>
         <form action="/admin/update_profile" method="POST" class="space-y-4">
@@ -383,14 +380,13 @@ ADMIN_TEMPLATE = """<!DOCTYPE html>
             <input type="text" name="new_username" value="{{ current_user.username }}" class="w-full bg-[#1a2332] border border-slate-700/60 rounded-xl px-4 py-2 text-sm text-white focus:outline-none focus:border-blue-500" required>
           </div>
           <div>
-            <label class="block text-xs font-semibold text-slate-400 mb-1">Yeni Şifre (Boş bırakırsanız değişmez)</label>
+            <label class="block text-xs font-semibold text-slate-400 mb-1">Yeni Şifre (Değişmeyecekse boş bırakın)</label>
             <input type="password" name="new_password" placeholder="••••••••" class="w-full bg-[#1a2332] border border-slate-700/60 rounded-xl px-4 py-2 text-sm text-white focus:outline-none focus:border-blue-500">
           </div>
           <button type="submit" class="w-full py-2.5 bg-blue-600 hover:bg-blue-500 rounded-xl font-bold text-sm">Bilgileri Güncelle</button>
         </form>
       </div>
 
-      <!-- Yeni Kullanıcı Ekle -->
       <div class="bg-[#151c28] border border-slate-800 rounded-2xl p-6 shadow-xl">
         <h2 class="text-lg font-bold mb-4">Yeni Kullanıcı Ekle</h2>
         <form action="/admin/add_user" method="POST" class="space-y-4">
@@ -411,7 +407,6 @@ ADMIN_TEMPLATE = """<!DOCTYPE html>
       </div>
     </div>
     
-    <!-- Kullanıcı Listesi -->
     <div class="bg-[#151c28] border border-slate-800 rounded-2xl p-6 shadow-xl">
       <h2 class="text-lg font-bold mb-4">Kayıtlı Kullanıcılar ({{ users|length }})</h2>
       <table class="w-full text-left text-sm">
@@ -443,7 +438,7 @@ ADMIN_TEMPLATE = """<!DOCTYPE html>
 </body>
 </html>"""
 
-# ==================== ROUTE 'LAR ====================
+# ==================== ROUTE'LAR ====================
 
 @app.route('/')
 def home():
@@ -480,8 +475,6 @@ def logout():
     logout_user()
     return redirect(url_for('home'))
 
-# ==================== ADMIN ROUTE 'LARI ====================
-
 @app.route('/admin')
 @login_required
 def admin_panel():
@@ -510,7 +503,7 @@ def update_profile():
         current_user.set_password(new_password)
         
     db.session.commit()
-    flash('Profil bilgileriniz güncellendi!')
+    flash('Profil bilgileriniz başarıyla güncellendi!')
     return redirect(url_for('admin_panel'))
 
 @app.route('/admin/add_user', methods=['POST'])
