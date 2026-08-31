@@ -3,7 +3,7 @@ from flask_sqlalchemy import SQLAlchemy
 from flask_login import LoginManager, UserMixin, login_user, login_required, logout_user, current_user
 from werkzeug.security import generate_password_hash, check_password_hash
 from flask_cors import CORS
-from tefas import TheTefas
+from tefas.crawler import TEFAS
 from datetime import datetime, timedelta
 import calendar
 import os
@@ -18,7 +18,7 @@ login_manager = LoginManager(app)
 login_manager.login_view = 'login'
 CORS(app)
 
-tefas = TheTefas()
+tefas = TEFAS()
 
 # ==================== VERİTABANI MODELLERİ ====================
 
