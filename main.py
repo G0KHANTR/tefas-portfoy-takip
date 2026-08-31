@@ -3,7 +3,7 @@ from flask_sqlalchemy import SQLAlchemy
 from flask_login import LoginManager, UserMixin, login_user, login_required, logout_user, current_user
 from werkzeug.security import generate_password_hash, check_password_hash
 from flask_cors import CORS
-from tefas.crawler import TEFAS
+import tefas
 from datetime import datetime, timedelta
 import calendar
 import os
@@ -18,7 +18,7 @@ login_manager = LoginManager(app)
 login_manager.login_view = 'login'
 CORS(app)
 
-tefas = TEFAS()
+tefas_client = tefas.Crawler()
 
 # ==================== VERİTABANI MODELLERİ ====================
 
@@ -64,7 +64,7 @@ def get_tefas_price_on_date(fon_kodu, hedef_tarih_str):
     try:
         hedef_tarih = datetime.strptime(hedef_tarih_str, "%Y-%m-%d")
         baslangic = hedef_tarih - timedelta(days=10)
-        df = tefas.fetch(start=baslangic.strftime("%Y-%m-%d"), end=hedef_tarih_str, name=fon_kodu.upper())
+        df = tefas_client.fetch(start=baslangic.strftime("%Y-%m-%d"), end=hedef_tarih_str, name=fon_kodu.upper())
         if df is not None and not df.empty:
             df['date'] = df['date'].astype(str)
             df = df.sort_values(by='date', ascending=False)
@@ -79,7 +79,7 @@ def get_tefas_data_crawler(fon_kodu):
     try:
         bugun = datetime.now()
         baslangic = bugun - timedelta(days=1850)
-        df = tefas.fetch(start=baslangic.strftime("%Y-%m-%d"), end=bugun.strftime("%Y-%m-%d"), name=fon_kodu.upper())
+        df = tefas_client.fetch(start=baslangic.strftime("%Y-%m-%d"), end=bugun.strftime("%Y-%m-%d"), name=fon_kodu.upper())
         if df is not None and not df.empty:
             df['date'] = df['date'].astype(str)
             df = df.sort_values(by='date', ascending=False)
